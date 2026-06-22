@@ -62,6 +62,7 @@
   let panSession = null;
   let nodeDragSession = null;
   let connectionSession = null;
+  let edgeCancelSession = null;
   let selectionSession = null;
   let toastTimer = null;
   let pendingImageData = "";
@@ -124,6 +125,105 @@
     }
   }
 
+  function normalizeImportedState(payload) {
+    const source = payload?.state || payload;
+    if (!source || !Array.isArray(source.nodes) || !Array.isArray(source.edges)) {
+      throw new Error("文件中没有可识别的任务链数据");
+    }
+
+    const ids = new Set();
+    const nodes = source.nodes.map((item, index) => {
+      const preferredId = String(item?.id || `imported-${index + 1}`);
+      let id = preferredId;
+      let suffix = 2;
+      while (ids.has(id)) id = `${preferredId}-${suffix++}`;
+      ids.add(id);
+      return {
+        id,
+        x: Number.isFinite(Number(item?.x)) ? Number(item.x) : 120 + index * 300,
+        y: Number.isFinite(Number(item?.y)) ? Number(item.y) : 150,
+        type: ["start", "task", "supplement", "end"].includes(item?.type) ? item.type : "task",
+        status: Object.prototype.hasOwnProperty.call(statusMeta, item?.status) ? item.status : "todo",
+        priority: normalizePriority(item?.priority),
+        title: String(item?.title || "未命名任务"),
+        requester: String(item?.requester || "").trim(),
+        goal: String(item?.goal || ""),
+        note: String(item?.note ?? [item?.progress, item?.blocker].filter(Boolean).join("；")),
+        image: typeof item?.image === "string" ? item.image : "",
+        date: String(item?.date || isoDate(new Date())),
+      };
+    });
+
+    const adjacency = new Map(nodes.map((node) => [node.id, []]));
+    const seenPairs = new Set();
+    const edges = [];
+    const reaches = (startId, targetId) => {
+      const queue = [startId];
+      const visited = new Set();
+      while (queue.length) {
+        const currentId = queue.shift();
+        if (currentId === targetId) return true;
+        if (visited.has(currentId)) continue;
+        visited.add(currentId);
+        (adjacency.get(currentId) || []).forEach((nextId) => queue.push(nextId));
+      }
+      return false;
+    };
+
+    source.edges.forEach((item, index) => {
+      const from = String(item?.from || "");
+      const to = String(item?.to || "");
+      const pair = `${from}\u0000${to}`;
+      if (!ids.has(from) || !ids.has(to) || from === to || seenPairs.has(pair) || reaches(to, from)) return;
+      seenPairs.add(pair);
+      adjacency.get(from).push(to);
+      edges.push({ id: String(item?.id || `imported-edge-${index + 1}`), from, to });
+    });
+
+    const importedView = source.view || {};
+    return {
+      nodes,
+      edges,
+      view: {
+        x: Number.isFinite(Number(importedView.x)) ? Number(importedView.x) : state.view.x,
+        y: Number.isFinite(Number(importedView.y)) ? Number(importedView.y) : state.view.y,
+        zoom: Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Number(importedView.zoom) || state.view.zoom)),
+      },
+    };
+  }
+
+  function exportTaskData() {
+    const payload = {
+      format: "flowlog-task-data",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      state,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `Flowlog_任务数据_${isoDate(new Date())}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    showToast("任务数据已导出");
+  }
+
+  async function importTaskData(file) {
+    const payload = JSON.parse(await file.text());
+    const importedState = normalizeImportedState(payload);
+    if (state.nodes.length && !window.confirm(`导入将替换当前画布的 ${state.nodes.length} 个节点，是否继续？`)) return false;
+    pushUndoSnapshot();
+    state = importedState;
+    selectedNodeId = null;
+    multiSelectedNodeIds.clear();
+    expandedGoalNodes.clear();
+    saveState();
+    renderAll();
+    showToast(`已导入 ${state.nodes.length} 个节点、${state.edges.length} 条连线`);
+    return true;
+  }
+
   function isoDate(date) {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, "0");
@@ -165,7 +265,7 @@
 
   function derivedType(nodeId) {
     if (incomingCount(nodeId) === 0) return "start";
-    if (outgoingCount(nodeId) === 0) return "end";
+    if (nodeById(nodeId)?.status === "done") return "end";
     return "task";
   }
 
@@ -206,7 +306,7 @@
 
   function effectiveRequester(nodeId) {
     const node = nodeById(nodeId);
-    return derivedType(nodeId) === "task" ? (chainStart(nodeId)?.requester || node?.requester || "") : (node?.requester || "");
+    return derivedType(nodeId) !== "start" ? (chainStart(nodeId)?.requester || node?.requester || "") : (node?.requester || "");
   }
 
   function chainComponents() {
@@ -333,6 +433,9 @@
         return effectiveRequester(chainStart(a[0].id)?.id || a[0].id).localeCompare(effectiveRequester(chainStart(b[0].id)?.id || b[0].id), "zh-CN");
       });
     pushUndoSnapshot();
+    const columnPitch = 300;
+    const rowPitch = 194;
+    const chainGap = 44;
     let chainTop = 150;
     components.forEach((component) => {
       const ids = new Set(component.map((node) => node.id));
@@ -352,6 +455,19 @@
         if (!columns.has(level)) columns.set(level, []);
         columns.get(level).push(node);
       });
+      const hasBranch = component.some((node) => state.edges.filter((edge) => edge.from === node.id && ids.has(edge.to)).length > 1);
+      if (!hasBranch) {
+        [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, nodes]) => {
+          nodes.sort((a, b) => a.id.localeCompare(b.id));
+          nodes.forEach((node, index) => {
+            node.x = 120 + (level + index) * columnPitch;
+            node.y = chainTop;
+          });
+        });
+        chainTop += NODE_CARD_TOP + NODE_CARD_HEIGHT + chainGap;
+        return;
+      }
+
       const maxRegularRows = Math.max(1, ...[...columns.values()].map((nodes) => nodes.filter((node) => node.status !== "blocked").length));
       const maxBlockedRows = Math.max(0, ...[...columns.values()].map((nodes) => nodes.filter((node) => node.status === "blocked").length));
       [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, nodes]) => {
@@ -359,21 +475,20 @@
         const regularNodes = nodes.filter((node) => node.status !== "blocked");
         const blockedNodes = nodes.filter((node) => node.status === "blocked");
         regularNodes.forEach((node, index) => {
-          node.x = 120 + level * 330;
-          node.y = chainTop + index * 215;
+          node.x = 120 + level * columnPitch;
+          node.y = chainTop + index * rowPitch;
         });
         blockedNodes.forEach((node, index) => {
-          node.x = 120 + level * 330;
-          node.y = chainTop + maxRegularRows * 215 + index * 215;
+          node.x = 120 + level * columnPitch;
+          node.y = chainTop + maxRegularRows * rowPitch + index * rowPitch;
         });
       });
-      chainTop += (maxRegularRows + maxBlockedRows) * 215 + 120;
+      chainTop += (maxRegularRows + maxBlockedRows) * rowPitch + chainGap;
     });
     selectedNodeId = null;
     clearMultiSelection();
     saveState();
     renderAll();
-    fitCanvas();
     showToast("已按优先级和人名完成排版");
   }
 
@@ -421,16 +536,39 @@
   }
 
   function chainGoal(nodeId) {
-    const chain = connectedNodes(nodeId);
-    const start = chain.find((node) => incomingCount(node.id) === 0);
-    return start?.goal || chain.find((node) => node.goal)?.goal || "待补充任务链目标";
+    return chainStart(nodeId)?.goal || "待补充任务链目标";
+  }
+
+  function progressPathNodes(nodeId) {
+    const pathIds = [nodeId];
+    let currentId = nodeId;
+    const visited = new Set(pathIds);
+
+    while (true) {
+      const incoming = state.edges.filter((edge) => edge.to === currentId && !visited.has(edge.from));
+      if (incoming.length !== 1) break;
+      currentId = incoming[0].from;
+      pathIds.unshift(currentId);
+      visited.add(currentId);
+    }
+
+    currentId = nodeId;
+    while (true) {
+      const outgoing = state.edges.filter((edge) => edge.from === currentId && !visited.has(edge.to));
+      if (outgoing.length !== 1) break;
+      currentId = outgoing[0].to;
+      pathIds.push(currentId);
+      visited.add(currentId);
+    }
+
+    return pathIds.map(nodeById).filter(Boolean);
   }
 
   function chainProgressMarkup(nodeId) {
-    const nodes = connectedNodes(nodeId).sort((a, b) => a.x - b.x || a.y - b.y);
+    const nodes = progressPathNodes(nodeId);
     return `<div class="chain-progress-list">${nodes.map((node, index) => {
       const status = statusMeta[node.status]?.label || "开启";
-      const detail = node.note || `状态：${status}`;
+      const detail = node.note || `任务状态：${status}`;
       return `<div class="chain-progress-item"><b>${index + 1}</b><span>${escapeHtml(detail)}</span></div>`;
     }).join("")}</div>`;
   }
@@ -477,8 +615,8 @@
       const status = statusMeta[node.status] || statusMeta.todo;
       const detail = node.note || "点击补充当前进展或卡点说明";
       const requester = effectiveRequester(node.id) || "未填写来源人";
-      const isMiddle = nodeType === "task";
-      const displayTitle = isMiddle ? chainTaskName(node.id) : node.title;
+      const isChild = nodeType !== "start";
+      const displayTitle = isChild ? chainTaskName(node.id) : node.title;
       const priority = effectivePriority(node.id);
       const isEditing = selectedNodeId === node.id;
       const goalExpanded = expandedGoalNodes.has(node.id);
@@ -494,19 +632,19 @@
               <div class="node-type"><span class="node-type-icon">${icons[meta.icon]}</span>${meta.label}</div>
               <div class="node-header-actions"><span class="priority-badge${priority === 0 ? " priority-zero" : ""}" title="优先级 ${priority}">${priority}</span><button class="node-menu-button edit-node-button" ${isEditing ? `data-close-inline="${node.id}"` : `data-node-menu="${node.id}"`} aria-label="${isEditing ? "完成编辑" : "修改节点"}">${isEditing ? "✓" : icons.pencil}</button></div>
             </header>
-            ${isEditing ? inlineEditorMarkup(node, isMiddle) : `<div class="node-body">
+            ${isEditing ? inlineEditorMarkup(node, isChild) : `<div class="node-body">
               <div class="node-content-row">
                 <div class="node-copy">
-                  ${isMiddle ? `<h3 class="node-title node-main-progress" title="${escapeHtml(detail)}">${escapeHtml(detail)}</h3>` : `<h3 class="node-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</h3>`}
+                  ${isChild ? `<h3 class="node-title node-main-progress" title="${escapeHtml(detail)}">${escapeHtml(detail)}</h3>` : `<h3 class="node-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</h3>`}
                   <span class="node-requester" title="需求来源人">${icons.person}${escapeHtml(requester)}</span>
-                  ${isMiddle ? "" : `<p class="node-goal" title="${escapeHtml(node.goal || "暂未填写任务目标")}"><strong>目标</strong> ${escapeHtml(node.goal || "暂未填写任务目标")}</p>`}
-                  ${isMiddle ? `<p class="node-chain-name" title="${escapeHtml(displayTitle)}">任务 · ${escapeHtml(displayTitle)}</p>` : nodeType === "start" ? "" : `<p class="node-progress" title="${escapeHtml(detail)}">${escapeHtml(detail)}</p>`}
+                  ${nodeType === "start" ? `<p class="node-goal" title="${escapeHtml(node.goal || "暂未填写任务目标")}"><strong>目标</strong> ${escapeHtml(node.goal || "暂未填写任务目标")}</p>` : ""}
+                  ${isChild ? `<p class="node-chain-name" title="${escapeHtml(displayTitle)}">任务 · ${escapeHtml(displayTitle)}</p>` : ""}
                 </div>
                 ${node.image ? `<img class="node-product-image" src="${escapeHtml(node.image)}" alt="${escapeHtml(node.title)}的图片" />` : ""}
               </div>
             </div>
             <footer class="node-footer">
-              <select class="status-quick-select" data-quick-status="${node.id}" aria-label="设置节点状态">${statusOptions(node.status)}</select>
+              <span class="status-select-shell"><select class="status-quick-select" data-quick-status="${node.id}" aria-label="设置任务状态">${statusOptions(node.status)}</select></span>
               <span class="node-date">${escapeHtml(node.date || isoDate(new Date()))}</span>
             </footer>`}
           </div>
@@ -518,18 +656,18 @@
     });
   }
 
-  function inlineEditorMarkup(node, isMiddle) {
+  function inlineEditorMarkup(node, isChild) {
     const nodeType = derivedType(node.id);
-    const displayTitle = isMiddle ? chainTaskName(node.id) : node.title;
+    const displayTitle = isChild ? chainTaskName(node.id) : node.title;
     const requester = effectiveRequester(node.id);
     return `<div class="inline-node-editor">
-      <label class="inline-field inline-field-wide"><span>任务名称${isMiddle ? " · 跟随开始节点" : ""}</span><input class="inline-input" ${isMiddle ? "readonly" : `data-inline-field="title"`} value="${escapeHtml(displayTitle)}" /></label>
+      <label class="inline-field inline-field-wide"><span>任务名称${isChild ? " · 跟随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : `data-inline-field="title"`} value="${escapeHtml(displayTitle)}" /></label>
       <div class="inline-field-row">
-        <label class="inline-field"><span>需求来源人${isMiddle ? " · 随开始节点" : ""}</span><input class="inline-input" ${isMiddle ? "readonly" : 'data-inline-field="requester" list="peopleSuggestions"'} value="${escapeHtml(requester)}" placeholder="姓名" /></label>
+        <label class="inline-field"><span>需求来源人${isChild ? " · 随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : 'data-inline-field="requester" list="peopleSuggestions"'} value="${escapeHtml(requester)}" placeholder="姓名" /></label>
         <label class="inline-field"><span>优先级${nodeType === "start" ? "" : " · 随链路"}</span><input class="inline-input inline-priority-input" type="number" min="0" max="10" step="1" ${nodeType === "start" ? 'data-inline-field="priority"' : "readonly"} value="${effectivePriority(node.id)}" /></label>
       </div>
-      <label class="inline-field inline-field-wide"><span>当前状态</span><select class="inline-select" data-inline-field="status">${statusOptions(node.status)}</select></label>
-      ${isMiddle ? "" : `<label class="inline-field inline-field-wide"><span>任务目标 / 要求</span><textarea class="inline-textarea" data-inline-field="goal" placeholder="填写任务目标">${escapeHtml(node.goal)}</textarea></label>`}
+      <label class="inline-field inline-field-wide"><span>任务状态</span><select class="inline-select" data-inline-field="status">${statusOptions(node.status)}</select></label>
+      ${nodeType === "start" ? `<label class="inline-field inline-field-wide"><span>任务目标 / 要求</span><textarea class="inline-textarea" data-inline-field="goal" placeholder="填写任务目标">${escapeHtml(node.goal)}</textarea></label>` : ""}
       ${nodeType === "start" ? "" : `<label class="inline-field inline-field-wide"><span>当前进展 / 卡点说明</span><textarea class="inline-textarea" data-inline-field="note" placeholder="记录进展或卡点">${escapeHtml(node.note)}</textarea></label>`}
       <div class="inline-editor-footer">
         <label class="inline-image-button" for="inlineImage-${node.id}">${icons.image}${node.image ? "更换图片" : "添加图片"}</label>
@@ -603,7 +741,7 @@
         <input class="text-input" id="editRequester" data-field="requester" list="peopleSuggestions" value="${escapeHtml(node.requester)}" placeholder="输入姓名，可选择历史记录" />
         <div class="form-row">
           <div><label class="field-label" for="editType">节点类型</label><select class="select-input" id="editType" data-field="type">${typeOptions(node.type)}</select></div>
-          <div><label class="field-label" for="editStatus">当前状态</label><select class="select-input" id="editStatus" data-field="status">${statusOptions(node.status)}</select></div>
+          <div><label class="field-label" for="editStatus">任务状态</label><select class="select-input" id="editStatus" data-field="status">${statusOptions(node.status)}</select></div>
         </div>
       </div>
       <div class="editor-section">
@@ -945,6 +1083,31 @@
   }, { passive: false });
 
   canvas.addEventListener("pointerdown", (event) => {
+    const existingEdge = event.target.closest("[data-edge-id]");
+    if (existingEdge && event.button === 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      const session = {
+        edgeId: existingEdge.dataset.edgeId,
+        startX: event.clientX,
+        startY: event.clientY,
+        currentX: event.clientX,
+        currentY: event.clientY,
+        moved: false,
+        armed: false,
+        visualPath: existingEdge.previousElementSibling,
+        timer: null,
+      };
+      session.timer = setTimeout(() => {
+        if (edgeCancelSession !== session) return;
+        session.armed = true;
+        session.visualPath?.classList.add("canceling");
+        showToast("拖到空白画布并松开，可取消这条连线");
+      }, 420);
+      edgeCancelSession = session;
+      return;
+    }
+
     const handle = event.target.closest(".node-handle.output");
     if (handle) {
       event.stopPropagation();
@@ -1011,6 +1174,12 @@
   });
 
   window.addEventListener("pointermove", (event) => {
+    if (edgeCancelSession) {
+      edgeCancelSession.currentX = event.clientX;
+      edgeCancelSession.currentY = event.clientY;
+      edgeCancelSession.moved = Math.hypot(event.clientX - edgeCancelSession.startX, event.clientY - edgeCancelSession.startY) >= 18;
+      return;
+    }
     if (connectionSession) {
       connectionSession.point = canvasPoint(event.clientX, event.clientY);
       draftEdge.setAttribute("d", draftPath(nodeById(connectionSession.fromId), connectionSession.point));
@@ -1063,6 +1232,16 @@
   });
 
   window.addEventListener("pointerup", (event) => {
+    if (edgeCancelSession) {
+      const session = edgeCancelSession;
+      const releaseTarget = document.elementFromPoint(event.clientX, event.clientY);
+      const isBlankCanvas = Boolean(releaseTarget?.closest?.("#canvasShell")) && !releaseTarget.closest?.(".task-node, [data-edge-id], .zoom-controls, .status-legend");
+      clearTimeout(session.timer);
+      session.visualPath?.classList.remove("canceling");
+      edgeCancelSession = null;
+      if (session.armed && session.moved && isBlankCanvas) deleteEdge(session.edgeId);
+      return;
+    }
     if (connectionSession) {
       const fromId = connectionSession.fromId;
       const point = connectionSession.point;
@@ -1073,7 +1252,9 @@
       if (targetHandle) {
         addEdge(fromId, targetHandle.closest(".task-node").dataset.nodeId);
       } else {
-        const newNode = createNode({ title: chainTaskName(fromId), requester: effectiveRequester(fromId), priority: effectivePriority(fromId), type: "task", status: "todo", goal: "", note: "等待补充任务信息" }, { x: point.x + 20, y: point.y - 100 }, fromId);
+        const sourceType = derivedType(fromId);
+        const inheritedStatus = sourceType === "start" || sourceType === "task" ? "doing" : "todo";
+        const newNode = createNode({ title: chainTaskName(fromId), requester: effectiveRequester(fromId), priority: effectivePriority(fromId), type: "task", status: inheritedStatus, goal: "", note: "等待补充任务信息" }, { x: point.x + 20, y: point.y - 100 }, fromId);
         showToast("已自动创建后续节点");
       }
     }
@@ -1093,6 +1274,13 @@
       panSession = null;
       canvas.classList.remove("panning");
     }
+  });
+
+  window.addEventListener("pointercancel", () => {
+    if (!edgeCancelSession) return;
+    clearTimeout(edgeCancelSession.timer);
+    edgeCancelSession.visualPath?.classList.remove("canceling");
+    edgeCancelSession = null;
   });
 
   nodesLayer.addEventListener("click", (event) => {
@@ -1171,7 +1359,7 @@
       saveState();
       if (!displayedNodeIds().has(node.id)) selectedNodeId = null;
       renderAll();
-      showToast(`状态已设置为「${statusMeta[node.status].label}」`);
+      showToast(`任务状态已设置为「${statusMeta[node.status].label}」`);
       return;
     }
     const imageNodeId = event.target.dataset.nodeImage;
@@ -1300,6 +1488,34 @@
     showToast("节点已创建，点击铅笔图标编辑");
   });
   $("#reportButton").addEventListener("click", openReport);
+  $("#dataTransferButton").addEventListener("click", () => {
+    const menu = $("#dataTransferMenu");
+    menu.hidden = !menu.hidden;
+    $("#dataTransferButton").setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  $("#importDataButton").addEventListener("click", () => {
+    $("#dataTransferMenu").hidden = true;
+    $("#dataTransferButton").setAttribute("aria-expanded", "false");
+    $("#importDataInput").click();
+  });
+  $("#exportDataButton").addEventListener("click", () => {
+    $("#dataTransferMenu").hidden = true;
+    $("#dataTransferButton").setAttribute("aria-expanded", "false");
+    exportTaskData();
+  });
+  $("#importDataInput").addEventListener("change", async (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      await importTaskData(file);
+    } catch (error) {
+      console.warn("任务数据导入失败", error);
+      showToast(error instanceof SyntaxError ? "JSON 文件格式不正确" : (error.message || "任务数据导入失败"));
+    } finally {
+      input.value = "";
+    }
+  });
   $("#visibilityButton").addEventListener("click", () => {
     const modes = ["incomplete", "all", "completed"];
     taskVisibilityMode = modes[(modes.indexOf(taskVisibilityMode) + 1) % modes.length];
@@ -1349,6 +1565,10 @@
   });
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".task-search-shell")) searchResults.hidden = true;
+    if (!event.target.closest(".data-transfer")) {
+      $("#dataTransferMenu").hidden = true;
+      $("#dataTransferButton").setAttribute("aria-expanded", "false");
+    }
   });
 
   document.addEventListener("keydown", (event) => {
@@ -1358,6 +1578,8 @@
       return;
     }
     if (event.key === "Escape") {
+      $("#dataTransferMenu").hidden = true;
+      $("#dataTransferButton").setAttribute("aria-expanded", "false");
       $$(".modal-backdrop").forEach((modal) => modal.hidden = true);
       if (connectionSession) {
         connectionSession = null;

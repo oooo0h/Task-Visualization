@@ -43,6 +43,17 @@
             <svg viewBox="0 0 24 24"><path d="M4 6h7M4 12h11M4 18h16"/><path d="m18 5 2 2-2 2"/></svg>
             自动排版
           </button>
+          <div class="data-transfer">
+            <button class="button button-ghost" id="dataTransferButton" aria-expanded="false" aria-controls="dataTransferMenu">
+              <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 18v2h14v-2"/></svg>
+              数据
+            </button>
+            <div class="data-transfer-menu" id="dataTransferMenu" hidden>
+              <button type="button" id="importDataButton"><span>导入任务数据</span><small>从 JSON 恢复任务链</small></button>
+              <button type="button" id="exportDataButton"><span>导出任务数据</span><small>保存节点、连线和视角</small></button>
+            </div>
+            <input id="importDataInput" type="file" accept="application/json,.json" hidden />
+          </div>
           <button class="button button-ghost" id="reportButton">
             <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
             导出报告
@@ -141,7 +152,7 @@
                 </select>
               </div>
               <div>
-                <label class="field-label" for="newNodeStatus">当前状态</label>
+                <label class="field-label" for="newNodeStatus">任务状态</label>
                 <select class="select-input" id="newNodeStatus" name="status">
                   <option value="todo">开启</option>
                   <option value="doing">进行中</option>

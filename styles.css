@@ -111,6 +111,12 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .button-primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
 .button-ghost { background: var(--surface-solid); }
 .icon-button { width: 38px; padding: 0; }
+.data-transfer { position: relative; }
+.data-transfer-menu { position: absolute; right: 0; top: 44px; z-index: 90; width: 190px; padding: 6px; background: var(--surface-solid); border: 1px solid var(--line-strong); border-radius: 11px; box-shadow: var(--shadow-md); }
+.data-transfer-menu button { width: 100%; display: grid; gap: 2px; padding: 9px 10px; color: var(--ink); background: transparent; border: 0; border-radius: 8px; text-align: left; cursor: pointer; }
+.data-transfer-menu button:hover { background: var(--surface-hover); }
+.data-transfer-menu span { font-size: 11px; font-weight: 700; }
+.data-transfer-menu small { color: var(--muted); font-size: 8px; }
 
 .workspace { height: calc(100% - 68px); display: grid; grid-template-columns: 56px minmax(0, 1fr); }
 .tool-rail { background: var(--surface); border-right: 1px solid var(--line); padding: 12px 8px; display: flex; flex-direction: column; align-items: center; gap: 7px; position: relative; z-index: 15; }
@@ -130,15 +136,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .canvas-hint svg { width: 15px; height: 15px; color: var(--accent); }
 .pan-layer { position: absolute; left: 0; top: 0; width: 4000px; height: 2400px; transform-origin: 0 0; }
 .world { position: absolute; left: 0; top: 0; width: 4000px; height: 2400px; transform-origin: 0 0; }
-.edges-layer { position: absolute; inset: 0; width: 4000px; height: 2400px; overflow: visible; pointer-events: none; }
-#nodesLayer { position: absolute; inset: 0; }
+.edges-layer { position: absolute; inset: 0; width: 4000px; height: 2400px; overflow: visible; pointer-events: auto; }
+#nodesLayer { position: absolute; inset: 0; pointer-events: none; }
 .edge-underlay { fill: none; stroke: var(--surface-solid); stroke-width: 7; opacity: 0.92; vector-effect: non-scaling-stroke; }
 .edge-path { fill: none; stroke: var(--accent); stroke-width: 3.2; stroke-linecap: round; opacity: 0.92; marker-end: url(#arrow-active); vector-effect: non-scaling-stroke; }
 .edge-path.active { stroke: var(--accent); stroke-width: 3.3; marker-end: url(#arrow-active); }
+.edge-path.canceling { stroke: var(--blocked); stroke-dasharray: 7 5; marker-end: none; }
 .edge-shadow { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; cursor: pointer; vector-effect: non-scaling-stroke; }
 .draft-edge { stroke: var(--accent); stroke-dasharray: 6 5; marker-end: url(#arrow-active); }
 
-.task-node { position: absolute; width: var(--node-width); cursor: default; }
+.task-node { position: absolute; width: var(--node-width); cursor: default; pointer-events: auto; }
 .node-chain-label { height: 24px; display: inline-flex; align-items: center; gap: 5px; max-width: 228px; margin: 0 0 8px 9px; padding: 0 7px; color: var(--accent-strong); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); border-radius: 7px; font-size: 9px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 .node-chain-label svg { width: 12px; height: 12px; flex: none; }
 .node-chain-label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -187,8 +194,12 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .status-pill:hover { background: var(--node-soft); }
 .status-cycle { opacity: 0; transform: translateX(-3px); transition: 140ms ease; }
 .status-pill:hover .status-cycle { opacity: 0.8; transform: translateX(0); }
-.status-quick-select { height: 24px; margin-left: -6px; padding: 0 20px 0 7px; color: var(--node-color); background-color: transparent; border: 0; border-radius: 6px; outline: none; cursor: pointer; font-size: 9px; font-weight: 750; }
-.status-quick-select:hover, .status-quick-select:focus { background-color: var(--node-soft); }
+.status-select-shell { position: relative; height: 24px; margin-left: -6px; display: inline-flex; align-items: center; color: var(--node-color); background: var(--node-soft); border: 1px solid color-mix(in srgb, var(--node-color) 22%, transparent); border-radius: 7px; transition: 140ms ease; }
+.status-select-shell::before { content: ""; position: absolute; left: 7px; width: 6px; height: 6px; border-radius: 50%; background: var(--node-color); box-shadow: 0 0 0 2px color-mix(in srgb, var(--node-color) 12%, transparent); pointer-events: none; }
+.status-select-shell::after { content: ""; position: absolute; right: 8px; top: 7px; width: 5px; height: 5px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); pointer-events: none; }
+.status-select-shell:hover, .status-select-shell:focus-within { border-color: color-mix(in srgb, var(--node-color) 46%, transparent); box-shadow: 0 2px 7px color-mix(in srgb, var(--node-color) 12%, transparent); }
+.status-quick-select { appearance: none; -webkit-appearance: none; height: 22px; margin: 0; padding: 0 23px 0 19px; color: var(--node-color); background: transparent; border: 0; border-radius: 6px; outline: none; cursor: pointer; font-size: 9px; font-weight: 760; }
+.status-quick-select option { color: var(--ink); background: var(--surface-solid); }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--node-color); box-shadow: 0 0 0 3px var(--node-soft); }
 .node-date { font-size: 10px; color: var(--subtle); }
 .node-handle { position: absolute; top: 50%; width: 14px; height: 14px; margin-top: -7px; border-radius: 50%; background: var(--surface-solid); border: 2px solid var(--node-color); z-index: 5; cursor: crosshair; transition: transform 140ms ease, background 140ms ease; }
