@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f4f6f3" />
+    <title>Flowlog · 任务链</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand-group">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M7 7.2h5.3M11.7 16.8H17M7 7.2v9.6M17 7.2v9.6"/><circle cx="7" cy="7.2" r="2.2"/><circle cx="7" cy="16.8" r="2.2"/><circle cx="17" cy="7.2" r="2.2"/><circle cx="17" cy="16.8" r="2.2"/></svg>
+          </div>
+          <div>
+            <div class="brand-name">Flowlog</div>
+            <div class="brand-subtitle">任务链工作台</div>
+          </div>
+        </div>
+
+        <div class="topbar-center">
+          <div class="task-search-shell">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+            <input id="taskSearchInput" type="search" aria-label="搜索任务" placeholder="按人名或任务详情搜索" autocomplete="off" />
+            <div class="task-search-results" id="taskSearchResults" hidden></div>
+          </div>
+          <div class="date-chip">
+            <span class="live-dot"></span>
+            <span id="todayLabel"></span>
+          </div>
+          <span class="sync-state"><span class="sync-check">✓</span> 已自动保存</span>
+        </div>
+
+        <div class="topbar-actions">
+          <button class="button button-ghost icon-button" id="themeButton" aria-label="切换主题" title="切换明暗主题"></button>
+          <button class="button button-ghost visibility-button" id="visibilityButton" title="切换任务显示范围">
+            <svg viewBox="0 0 24 24"><path d="M3 12s3.2-6 9-6 9 6 9 6-3.2 6-9 6-9-6-9-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+            <span id="visibilityLabel">未完成任务</span>
+          </button>
+          <button class="button button-ghost" id="layoutButton" title="按优先级和人名自动排版">
+            <svg viewBox="0 0 24 24"><path d="M4 6h7M4 12h11M4 18h16"/><path d="m18 5 2 2-2 2"/></svg>
+            自动排版
+          </button>
+          <button class="button button-ghost" id="reportButton">
+            <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
+            导出报告
+          </button>
+          <button class="button button-primary" id="addButton">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            新建节点
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="tool-rail" aria-label="画布工具">
+          <button class="rail-button active" data-tool="select" title="选择与移动">
+            <svg viewBox="0 0 24 24"><path d="m6 4 12 8-6 1.4L9.2 19 6 4Z"/></svg>
+          </button>
+          <button class="rail-button" id="railAddButton" title="新建节点">
+            <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8v8M8 12h8"/></svg>
+          </button>
+          <div class="rail-separator"></div>
+          <button class="rail-button" id="fitButton" title="适应画布">
+            <svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg>
+          </button>
+          <button class="rail-button" id="resetButton" title="恢复示例">
+            <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.34-5.66L4 8.68M4 4v4.68h4.68"/></svg>
+          </button>
+        </aside>
+
+        <section class="canvas-shell" id="canvasShell">
+          <div class="grid-layer"></div>
+          <div class="selection-box" id="selectionBox" hidden></div>
+          <div class="selection-count" id="selectionCount" hidden></div>
+          <div class="canvas-hint" id="canvasHint">
+            <svg viewBox="0 0 24 24"><path d="M8 3v3M16 3v3M8 18v3M16 18v3M3 8h3M18 8h3M3 16h3M18 16h3"/><rect x="6" y="6" width="12" height="12" rx="3"/></svg>
+            Shift + 拖动框选 · 拖动任一已选节点可整体移动
+          </div>
+
+          <div class="pan-layer" id="panLayer">
+            <div class="world" id="world">
+              <svg class="edges-layer" id="edgesLayer" width="4000" height="2400" viewBox="0 0 4000 2400" aria-hidden="true">
+              <defs>
+                <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                  <path d="M0 0 8 4 0 8Z" fill="var(--edge)" />
+                </marker>
+                <marker id="arrow-active" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                  <path d="M0 0 8 4 0 8Z" fill="var(--accent)" />
+                </marker>
+              </defs>
+              <g id="edgePaths"></g>
+              <path id="draftEdge" class="edge-path draft-edge" d="" hidden></path>
+              </svg>
+              <div id="nodesLayer"></div>
+            </div>
+          </div>
+
+          <div class="status-legend" id="statusLegend"></div>
+
+          <div class="zoom-controls">
+            <button id="zoomOutButton" aria-label="缩小">−</button>
+            <span id="zoomLabel">100%</span>
+            <button id="zoomInButton" aria-label="放大">＋</button>
+          </div>
+        </section>
+
+        <aside class="editor-panel" id="editorPanel" aria-label="节点详情">
+          <div class="editor-empty" id="editorEmpty">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/></svg>
+            </div>
+            <h2>选择一个节点</h2>
+            <p>点击画布上的节点，查看并编辑任务详情。</p>
+          </div>
+          <div class="editor-content" id="editorContent" hidden></div>
+        </aside>
+      </main>
+
+      <div class="modal-backdrop" id="nodeModal" hidden>
+        <section class="modal node-create-modal" role="dialog" aria-modal="true" aria-labelledby="nodeModalTitle">
+          <button class="modal-close" data-close-modal="nodeModal" aria-label="关闭">×</button>
+          <div class="modal-eyebrow">NEW TASK NODE</div>
+          <h2 id="nodeModalTitle">新建任务节点</h2>
+          <p class="modal-intro">先记录当前要做的事，细节可以稍后在右侧面板补充。</p>
+          <form id="nodeForm">
+            <label class="field-label" for="newNodeTitle">任务名称</label>
+            <input class="text-input" id="newNodeTitle" name="title" placeholder="例如：完成数据看板原型" autocomplete="off" required />
+            <label class="field-label" for="newNodeRequester">需求来源人</label>
+            <input class="text-input" id="newNodeRequester" name="requester" list="peopleSuggestions" placeholder="输入姓名，使用过的姓名会自动记住" autocomplete="off" />
+            <div class="form-row">
+              <div>
+                <label class="field-label" for="newNodeType">节点类型</label>
+                <select class="select-input" id="newNodeType" name="type">
+                  <option value="task">普通任务</option>
+                  <option value="start">开始节点</option>
+                  <option value="supplement">信息补充</option>
+                  <option value="end">结束节点</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" for="newNodeStatus">当前状态</label>
+                <select class="select-input" id="newNodeStatus" name="status">
+                  <option value="todo">开启</option>
+                  <option value="doing">进行中</option>
+                  <option value="blocked">卡点</option>
+                  <option value="done">结束</option>
+                </select>
+              </div>
+            </div>
+            <label class="field-label" for="newNodeGoal">任务目标 / 要求</label>
+            <textarea class="text-area" id="newNodeGoal" name="goal" rows="3" placeholder="这个节点完成后，需要达到什么结果？"></textarea>
+            <label class="field-label" for="newNodeNote">当前进展 / 卡点说明</label>
+            <textarea class="text-area" id="newNodeNote" name="note" rows="2" placeholder="记录做到哪一步；遇到卡点时直接在这里说明"></textarea>
+            <label class="field-label">产品 / 型号图片</label>
+            <label class="image-upload-control" for="newNodeImage">
+              <span class="upload-icon"><svg viewBox="0 0 24 24"><path d="M4 17.5V6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5Z"/><circle cx="9" cy="9" r="2"/><path d="m4 16 4-4 3 3 2-2 7 6"/></svg></span>
+              <span><strong>选择一张图片</strong><small>会自动压缩并保存在本地</small></span>
+              <img id="newImagePreview" alt="待上传图片预览" hidden />
+            </label>
+            <input id="newNodeImage" type="file" accept="image/*" hidden />
+            <div class="modal-actions">
+              <button type="button" class="button button-ghost" data-close-modal="nodeModal">取消</button>
+              <button type="submit" class="button button-primary">创建节点</button>
+            </div>
+          </form>
+        </section>
+      </div>
+
+      <div class="modal-backdrop" id="reportModal" hidden>
+        <section class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="reportModalTitle">
+          <button class="modal-close" data-close-modal="reportModal" aria-label="关闭">×</button>
+          <div class="modal-eyebrow">WORK REPORT</div>
+          <h2 id="reportModalTitle">生成工作报告</h2>
+          <div class="report-tabs" role="tablist">
+            <button class="report-tab active" data-period="day">日报</button>
+            <button class="report-tab" data-period="week">周报</button>
+            <button class="report-tab" data-period="month">月报</button>
+          </div>
+          <div class="report-overview" id="reportOverview"></div>
+          <textarea class="report-preview" id="reportPreview" aria-label="报告预览"></textarea>
+          <div class="modal-actions report-actions">
+            <button type="button" class="button button-ghost" id="copyReportButton">
+              <svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
+              复制内容
+            </button>
+            <button type="button" class="button button-primary" id="downloadReportButton">
+              <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
+              导出 TXT
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <div class="toast" id="toast" role="status"></div>
+      <datalist id="peopleSuggestions"></datalist>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
