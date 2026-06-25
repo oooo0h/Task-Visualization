@@ -4,13 +4,23 @@
   const STORAGE_KEY = "flowlog-canvas-v1";
   const THEME_KEY = "flowlog-theme";
   const PEOPLE_KEY = "flowlog-people-v1";
+  const PEOPLE_HIDDEN_KEY = "flowlog-people-hidden-v1";
+  const PEOPLE_STATS_KEY = "flowlog-people-publication-stats-v1";
+  const PEOPLE_COUNTED_TASKS_KEY = "flowlog-people-counted-tasks-v1";
   const TEMPLATE_KEY = "flowlog-templates-v1";
   const NODE_WIDTH = 252;
   const NODE_CARD_TOP = 32;
   const NODE_CARD_HEIGHT = 160;
   const INLINE_CARD_HEIGHT = 344;
+  const MAX_NODE_IMAGES = 12;
   const MIN_ZOOM = 0.45;
   const MAX_ZOOM = 1.65;
+  const COMPLETED_CLEANUP_DAYS = 30;
+  const SNAPSHOT_PADDING = 80;
+  const SNAPSHOT_TARGET_SCALE = 3;
+  const SNAPSHOT_MAX_DIMENSION = 12000;
+  const SNAPSHOT_MAX_PIXELS = 90000000;
+  const PERSON_INPUT_SELECTOR = 'input[data-person-input="true"], input[list="peopleSuggestions"]';
 
   const statusMeta = {
     todo: { label: "开启", color: "var(--todo)" },
@@ -38,6 +48,7 @@
     image: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m3 17 5-5 4 4 2-2 7 6"/></svg>',
     template: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9h8M8 13h5M15 16v4M13 18h4"/></svg>',
     pencil: '<svg viewBox="0 0 24 24"><path d="m4 20 4.2-1 10.6-10.6a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Z"/><path d="m14.5 7.1 2.8 2.8"/></svg>',
+    pin: '<svg viewBox="0 0 24 24"><path d="m14 4 6 6-3.2 1.1-3.4 3.4.5 4.1-1.2 1.2-3.2-5.2-5.2-3.2 1.2-1.2 4.1.5 3.4-3.4L14 4Z"/><path d="M9.5 14.5 4 20"/></svg>',
     more: '<svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></svg>',
   };
 
@@ -57,6 +68,7 @@
   const editorEmpty = $("#editorEmpty");
   const editorContent = $("#editorContent");
   const templateList = $("#templateList");
+  const peopleList = $("#peopleList");
 
   let state = loadState();
   let templates = loadTemplates();
@@ -69,13 +81,19 @@
   let edgeCancelSession = null;
   let selectionSession = null;
   let toastTimer = null;
-  let pendingImageData = "";
+  let pendingImageData = [];
+  let lightboxImages = [];
+  let lightboxIndex = 0;
   let fieldUndoSnapshot = null;
   let serverSyncTimer = null;
+  let activePersonInput = null;
+  let personSuggestionIndex = -1;
+  const pinnedInlineNodeIds = new Set();
   const undoStack = [];
   const expandedGoalNodes = new Set();
   const multiSelectedNodeIds = new Set();
   let collapsedBranchNodes = new Set(Array.isArray(state.view?.collapsedBranches) ? state.view.collapsedBranches.map(String) : []);
+  let autoCollapsedBranchNodes = new Set(Array.isArray(state.view?.autoCollapsedBranches) ? state.view.autoCollapsedBranches.map(String) : []);
 
   function defaultState() {
     const date = isoDate(new Date());
@@ -96,23 +114,45 @@
         { id: "e5", from: "n5", to: "n4" },
         { id: "e6", from: "n4", to: "n6" },
       ],
-      view: { x: 44, y: 58, zoom: 0.82, collapsedBranches: [] },
+      view: { x: 44, y: 58, zoom: 0.82, collapsedBranches: [], autoCollapsedBranches: [] },
     };
+  }
+
+  function normalizeImageList(images, legacyImage = "") {
+    const values = Array.isArray(images) ? images : [];
+    return [...new Set([...values, legacyImage]
+      .filter((value) => typeof value === "string" && value.trim()))]
+      .slice(0, MAX_NODE_IMAGES);
+  }
+
+  function nodeImages(node) {
+    return normalizeImageList(node?.images, node?.image);
+  }
+
+  function setNodeImages(node, images) {
+    const normalized = normalizeImageList(images);
+    node.images = normalized;
+    node.image = normalized[0] || "";
   }
 
   function loadState() {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
       if (saved?.nodes && saved?.edges && saved?.view) {
-        saved.nodes = saved.nodes.map((node) => ({
-          ...node,
-          requester: node.requester || "",
-          note: node.note ?? [node.progress, node.blocker].filter(Boolean).join("；"),
-          image: node.image || "",
-          priority: normalizePriority(node.priority),
-          completedAt: normalizeCompletionDate(node.completedAt),
-        }));
+        saved.nodes = saved.nodes.map((node) => {
+          const images = normalizeImageList(node.images, node.image);
+          return {
+            ...node,
+            requester: node.requester || "",
+            note: node.note ?? [node.progress, node.blocker].filter(Boolean).join("；"),
+            image: images[0] || "",
+            images,
+            priority: normalizePriority(node.priority),
+            completedAt: normalizeCompletionDate(node.completedAt),
+          };
+        });
         saved.view.collapsedBranches = Array.isArray(saved.view.collapsedBranches) ? saved.view.collapsedBranches.map(String) : [];
+        saved.view.autoCollapsedBranches = Array.isArray(saved.view.autoCollapsedBranches) ? saved.view.autoCollapsedBranches.map(String) : [];
         return saved;
       }
     } catch (error) {
@@ -123,6 +163,7 @@
 
   function saveState() {
     try {
+      cleanupExpiredCompletedChains();
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       queueServerStateSync();
       return true;
@@ -148,7 +189,25 @@
     try {
       const saved = JSON.parse(localStorage.getItem(TEMPLATE_KEY));
       if (!Array.isArray(saved)) return [];
-      return saved.filter((template) => template && Array.isArray(template.nodes) && Array.isArray(template.edges)).slice(0, 50);
+      const templatePeople = [];
+      const sanitized = saved
+        .filter((template) => template && Array.isArray(template.nodes) && Array.isArray(template.edges))
+        .slice(0, 50)
+        .map((template) => {
+          templatePeople.push(template.requester);
+          const { requester: _templateRequester, ...templateData } = template;
+          return {
+            ...templateData,
+            nodes: template.nodes.map((node) => {
+              templatePeople.push(node.requester);
+              const { requester: _nodeRequester, ...nodeData } = node;
+              return nodeData;
+            }),
+          };
+        });
+      rememberPeople(templatePeople, { promote: false, render: false });
+      localStorage.setItem(TEMPLATE_KEY, JSON.stringify(sanitized));
+      return sanitized;
     } catch (error) {
       console.warn("无法读取任务模板", error);
       return [];
@@ -179,6 +238,7 @@
       let suffix = 2;
       while (ids.has(id)) id = `${preferredId}-${suffix++}`;
       ids.add(id);
+      const images = normalizeImageList(item?.images, item?.image);
       return {
         id,
         x: Number.isFinite(Number(item?.x)) ? Number(item.x) : 120 + index * 300,
@@ -190,7 +250,8 @@
         requester: String(item?.requester || "").trim(),
         goal: String(item?.goal || ""),
         note: String(item?.note ?? [item?.progress, item?.blocker].filter(Boolean).join("；")),
-        image: typeof item?.image === "string" ? item.image : "",
+        image: images[0] || "",
+        images,
         date: String(item?.date || isoDate(new Date())),
         completedAt: normalizeCompletionDate(item?.completedAt),
       };
@@ -233,6 +294,9 @@
         collapsedBranches: Array.isArray(importedView.collapsedBranches)
           ? importedView.collapsedBranches.map(String).filter((id) => ids.has(id))
           : [],
+        autoCollapsedBranches: Array.isArray(importedView.autoCollapsedBranches)
+          ? importedView.autoCollapsedBranches.map(String).filter((id) => ids.has(id))
+          : [],
       },
     };
   }
@@ -261,7 +325,9 @@
     pushUndoSnapshot();
     state = importedState;
     syncCollapsedBranchesFromState();
+    syncRequesterPublicationStatsFromState();
     selectedNodeId = null;
+    pinnedInlineNodeIds.clear();
     multiSelectedNodeIds.clear();
     expandedGoalNodes.clear();
     saveState();
@@ -289,19 +355,97 @@
     return Math.min(10, Math.max(0, Math.round(numeric)));
   }
 
+  function childNodes(nodeId) {
+    return state.edges.filter((edge) => edge.from === nodeId).map((edge) => nodeById(edge.to)).filter(Boolean);
+  }
+
+  function parentNodes(nodeId) {
+    return state.edges.filter((edge) => edge.to === nodeId).map((edge) => nodeById(edge.from)).filter(Boolean);
+  }
+
+  function branchIsComplete(nodeId, visiting = new Set()) {
+    const node = nodeById(nodeId);
+    if (!node || node.status !== "done" || visiting.has(nodeId)) return false;
+    const nextVisiting = new Set(visiting).add(nodeId);
+    return childNodes(nodeId).every((child) => branchIsComplete(child.id, nextVisiting));
+  }
+
   function setNodeStatus(node, nextStatus) {
+    const result = {
+      changedCount: 0,
+      autoCompletedCount: 0,
+      reopenedAncestorCount: 0,
+      blocked: false,
+      waitingCount: 0,
+    };
+    if (!node || !Object.prototype.hasOwnProperty.call(statusMeta, nextStatus)) return result;
+
     if (nextStatus === "done") {
+      const waitingChildren = childNodes(node.id).filter((child) => !branchIsComplete(child.id));
+      if (waitingChildren.length) {
+        result.blocked = true;
+        result.waitingCount = waitingChildren.length;
+        return result;
+      }
       const completedAt = isoDate(new Date());
-      const chain = connectedNodes(node.id);
-      chain.forEach((chainNode) => {
-        chainNode.status = "done";
-        chainNode.completedAt = completedAt;
-      });
-      return chain.length;
+      if (node.status !== "done") {
+        node.status = "done";
+        node.completedAt = completedAt;
+        result.changedCount += 1;
+      }
+      const queue = parentNodes(node.id);
+      const visited = new Set();
+      while (queue.length) {
+        const parent = queue.shift();
+        if (!parent || visited.has(parent.id)) continue;
+        visited.add(parent.id);
+        const children = childNodes(parent.id);
+        if (!children.length || !children.every((child) => branchIsComplete(child.id))) continue;
+        if (parent.status !== "done") {
+          parent.status = "done";
+          parent.completedAt = completedAt;
+          result.changedCount += 1;
+          result.autoCompletedCount += 1;
+        }
+        parentNodes(parent.id).forEach((ancestor) => queue.push(ancestor));
+      }
+      syncAutoCollapsedCompletedBranches();
+      return result;
     }
-    node.status = nextStatus;
-    node.completedAt = "";
-    return 1;
+
+    if (node.status !== nextStatus || node.completedAt) {
+      node.status = nextStatus;
+      node.completedAt = "";
+      result.changedCount += 1;
+    }
+    const queue = parentNodes(node.id);
+    const visited = new Set();
+    while (queue.length) {
+      const parent = queue.shift();
+      if (!parent || visited.has(parent.id)) continue;
+      visited.add(parent.id);
+      if (parent.status === "done") {
+        parent.status = "doing";
+        parent.completedAt = "";
+        result.changedCount += 1;
+        result.reopenedAncestorCount += 1;
+      }
+      parentNodes(parent.id).forEach((ancestor) => queue.push(ancestor));
+    }
+    syncAutoCollapsedCompletedBranches();
+    return result;
+  }
+
+  function statusChangeMessage(node, result) {
+    if (result.blocked) return `还有 ${result.waitingCount} 个后续分支未结束，当前节点暂不能结束`;
+    if (node.status === "done") {
+      return result.autoCompletedCount
+        ? `当前分支已结束，${result.autoCompletedCount} 个前置节点已自动结束`
+        : "当前分支已结束，其他分支不受影响";
+    }
+    return result.reopenedAncestorCount
+      ? `节点已设为「${statusMeta[node.status].label}」，${result.reopenedAncestorCount} 个前置节点已恢复为进行中`
+      : `任务状态已设置为「${statusMeta[node.status].label}」`;
   }
 
   function formatDate(date = new Date()) {
@@ -387,13 +531,55 @@
     return components;
   }
 
+  function dateDaysAgo(days, now = new Date()) {
+    const date = new Date(now);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - days);
+    return isoDate(date);
+  }
+
+  function completionDateForCleanup(node) {
+    return normalizeCompletionDate(node?.completedAt) || normalizeCompletionDate(node?.date);
+  }
+
+  function componentCompletionDate(component) {
+    return component
+      .map(completionDateForCleanup)
+      .filter(Boolean)
+      .sort()
+      .at(-1) || "";
+  }
+
+  function cleanupExpiredCompletedChains(now = new Date()) {
+    const cutoff = dateDaysAgo(COMPLETED_CLEANUP_DAYS, now);
+    const expiredIds = new Set();
+    chainComponents().forEach((component) => {
+      if (!component.length || !component.every((node) => node.status === "done")) return;
+      const completedAt = componentCompletionDate(component);
+      if (completedAt && completedAt < cutoff) component.forEach((node) => expiredIds.add(node.id));
+    });
+    if (!expiredIds.size) return false;
+    state.nodes = state.nodes.filter((node) => !expiredIds.has(node.id));
+    state.edges = state.edges.filter((edge) => !expiredIds.has(edge.from) && !expiredIds.has(edge.to));
+    collapsedBranchNodes = new Set([...collapsedBranchNodes].filter((id) => !expiredIds.has(id)));
+    autoCollapsedBranchNodes = new Set([...autoCollapsedBranchNodes].filter((id) => !expiredIds.has(id)));
+    expiredIds.forEach((id) => {
+      pinnedInlineNodeIds.delete(id);
+      expandedGoalNodes.delete(id);
+      multiSelectedNodeIds.delete(id);
+    });
+    if (expiredIds.has(selectedNodeId)) selectedNodeId = null;
+    persistCollapsedBranches();
+    return true;
+  }
+
   function createStartTemplate(nodeId) {
     const root = chainStart(nodeId) || nodeById(nodeId);
     if (!root) return;
+    const images = nodeImages(root);
     const template = {
       id: `tpl-${Date.now().toString(36)}`,
       name: root.title || "未命名任务",
-      requester: effectiveRequester(root.id) || "未填写来源人",
       priority: effectivePriority(root.id),
       createdAt: isoDate(new Date()),
       nodes: [{
@@ -401,11 +587,11 @@
         x: 0,
         y: 0,
         title: root.title,
-        requester: root.requester || "",
         priority: effectivePriority(root.id),
         goal: root.goal || "",
         note: "",
-        image: root.image || "",
+        image: images[0] || "",
+        images,
       }],
       edges: [],
     };
@@ -429,6 +615,7 @@
     const baseY = Math.max(30, center.y - (NODE_CARD_TOP + NODE_CARD_HEIGHT) / 2);
     const seed = Date.now().toString(36);
     const date = isoDate(new Date());
+    const images = normalizeImageList(source.images, source.image);
     const newNode = {
       id: `n${seed}-1`,
       x: Math.round(baseX),
@@ -437,10 +624,11 @@
       status: "todo",
       priority: normalizePriority(source.priority),
       title: String(source.title || template.name || "未命名任务"),
-      requester: String(source.requester || ""),
+      requester: "",
       goal: String(source.goal || ""),
       note: "",
-      image: typeof source.image === "string" ? source.image : "",
+      image: images[0] || "",
+      images,
       date,
       completedAt: "",
     };
@@ -466,13 +654,19 @@
 
   function visibleNodeIds() {
     const today = isoDate(new Date());
-    return new Set(state.nodes.filter((node) => node.status !== "done" || node.completedAt === today).map((node) => node.id));
+    const visible = new Set();
+    chainComponents().forEach((component) => {
+      const chainIsComplete = component.every((node) => node.status === "done");
+      const completedToday = component.some((node) => normalizeCompletionDate(node.completedAt) === today);
+      if (!chainIsComplete || completedToday) component.forEach((node) => visible.add(node.id));
+    });
+    return visible;
   }
 
   function displayedNodeIds() {
     const visible = visibleNodeIds();
     const hidden = new Set();
-    collapsedBranchNodes.forEach((nodeId) => {
+    new Set([...collapsedBranchNodes, ...autoCollapsedBranchNodes]).forEach((nodeId) => {
       const queue = state.edges.filter((edge) => edge.from === nodeId).map((edge) => edge.to);
       while (queue.length) {
         const currentId = queue.shift();
@@ -492,12 +686,39 @@
         .map(String)
         .filter((id) => validIds.has(id)),
     );
-    persistCollapsedBranches();
+    autoCollapsedBranchNodes = new Set(
+      (Array.isArray(state.view?.autoCollapsedBranches) ? state.view.autoCollapsedBranches : [])
+        .map(String)
+        .filter((id) => validIds.has(id)),
+    );
+    syncAutoCollapsedCompletedBranches();
   }
 
   function persistCollapsedBranches() {
     state.view ||= { x: 0, y: 0, zoom: 1 };
     state.view.collapsedBranches = [...collapsedBranchNodes];
+    state.view.autoCollapsedBranches = [...autoCollapsedBranchNodes];
+  }
+
+  function isBranchCollapsed(nodeId) {
+    return collapsedBranchNodes.has(nodeId) || autoCollapsedBranchNodes.has(nodeId);
+  }
+
+  function syncAutoCollapsedCompletedBranches() {
+    const validIds = new Set(state.nodes.map((node) => node.id));
+    autoCollapsedBranchNodes = new Set([...autoCollapsedBranchNodes]
+      .filter((id) => validIds.has(id) && branchIsComplete(id)));
+    chainComponents().forEach((component) => {
+      if (component.every((node) => node.status === "done")) return;
+      component.forEach((fork) => {
+        const children = childNodes(fork.id);
+        if (children.length < 2) return;
+        children.forEach((child) => {
+          if (childNodes(child.id).length && branchIsComplete(child.id)) autoCollapsedBranchNodes.add(child.id);
+        });
+      });
+    });
+    persistCollapsedBranches();
   }
 
   function adjustVisibleChainSpacing() {
@@ -525,9 +746,12 @@
       return;
     }
     pushUndoSnapshot();
-    const willCollapse = !collapsedBranchNodes.has(nodeId);
+    const willCollapse = !isBranchCollapsed(nodeId);
     if (willCollapse) collapsedBranchNodes.add(nodeId);
-    else collapsedBranchNodes.delete(nodeId);
+    else {
+      collapsedBranchNodes.delete(nodeId);
+      autoCollapsedBranchNodes.delete(nodeId);
+    }
     persistCollapsedBranches();
     renderNodes();
     renderEdges();
@@ -594,15 +818,46 @@
     updateSelectionVisuals();
   }
 
+  function isInlineEditingNode(nodeId) {
+    return selectedNodeId === nodeId || pinnedInlineNodeIds.has(nodeId);
+  }
+
+  function closeInlineEdit(id) {
+    pinnedInlineNodeIds.delete(id);
+    if (selectedNodeId === id) selectedNodeId = null;
+  }
+
+  function toggleInlinePin(id) {
+    const node = nodeById(id);
+    if (!node) return;
+    if (pinnedInlineNodeIds.has(id)) {
+      closeInlineEdit(id);
+      renderNodes();
+      renderEdges();
+      showToast("已取消固定编辑");
+      return;
+    }
+    pinnedInlineNodeIds.add(id);
+    selectedNodeId = id;
+    multiSelectedNodeIds.clear();
+    multiSelectedNodeIds.add(id);
+    renderNodes();
+    renderEdges();
+    updateSelectionVisuals();
+    showToast("已固定显示编辑状态");
+  }
+
   function formatLayout() {
-    if (selectedNodeId) {
+    if (selectedNodeId && !pinnedInlineNodeIds.has(selectedNodeId)) {
+      if (!finalizeInlineEdit(selectedNodeId)) return;
       selectedNodeId = null;
       renderNodes();
     }
     const visible = displayedNodeIds();
     const today = isoDate(new Date());
     const layoutGroup = (component) => {
-      if (component.every((node) => node.status === "done" && node.completedAt === today)) return 2;
+      const start = chainStart(component[0]?.id);
+      if (component.every((node) => node.status === "done") && normalizeCompletionDate(start?.completedAt) === today) return 2;
       if (component.some((node) => node.status === "blocked")) return 1;
       return 0;
     };
@@ -773,22 +1028,335 @@
     }).join("")}</div>`;
   }
 
+  function storedPeople() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PEOPLE_KEY));
+      return Array.isArray(saved) ? saved : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function hiddenPeople() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PEOPLE_HIDDEN_KEY));
+      return Array.isArray(saved) ? saved : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function storedPersonStats() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PEOPLE_STATS_KEY));
+      if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+      return Object.fromEntries(Object.entries(saved)
+        .map(([name, count]) => [String(name || "").trim(), Math.max(0, Math.floor(Number(count) || 0))])
+        .filter(([name]) => Boolean(name)));
+    } catch {
+      return {};
+    }
+  }
+
+  function savePersonStats(stats) {
+    try {
+      const cleanStats = Object.fromEntries(Object.entries(stats || {})
+        .map(([name, count]) => [String(name || "").trim(), Math.max(0, Math.floor(Number(count) || 0))])
+        .filter(([name, count]) => Boolean(name) && count > 0));
+      localStorage.setItem(PEOPLE_STATS_KEY, JSON.stringify(cleanStats));
+    } catch {
+      // Source-person statistics are convenience data; task editing should keep working if storage fails.
+    }
+  }
+
+  function countedRequesterTasks() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PEOPLE_COUNTED_TASKS_KEY));
+      if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+      return Object.fromEntries(Object.entries(saved)
+        .map(([nodeId, requester]) => [String(nodeId || "").trim(), String(requester || "").trim()])
+        .filter(([nodeId, requester]) => Boolean(nodeId) && Boolean(requester)));
+    } catch {
+      return {};
+    }
+  }
+
+  function saveCountedRequesterTasks(taskMap) {
+    try {
+      const cleanMap = Object.fromEntries(Object.entries(taskMap || {})
+        .map(([nodeId, requester]) => [String(nodeId || "").trim(), String(requester || "").trim()])
+        .filter(([nodeId, requester]) => Boolean(nodeId) && Boolean(requester)));
+      localStorage.setItem(PEOPLE_COUNTED_TASKS_KEY, JSON.stringify(cleanMap));
+    } catch {
+      // Source-person statistics are convenience data; task editing should keep working if storage fails.
+    }
+  }
+
+  function cleanPeople(values) {
+    return [...new Set(values.map((name) => String(name || "").trim()).filter(Boolean))];
+  }
+
+  function rawKnownPeople() {
+    return cleanPeople([...storedPeople(), ...state.nodes.map((node) => node.requester)]);
+  }
+
   function knownPeople() {
-    let remembered = [];
-    try { remembered = JSON.parse(localStorage.getItem(PEOPLE_KEY)) || []; } catch { /* 使用节点中的姓名 */ }
-    return [...new Set([...remembered, ...state.nodes.map((node) => node.requester)].map((name) => String(name || "").trim()).filter(Boolean))];
+    const hidden = new Set(hiddenPeople());
+    return rawKnownPeople().filter((name) => !hidden.has(name));
+  }
+
+  function taskPublicationRequester(node) {
+    const requester = String(node?.requester || "").trim();
+    return node && requester && incomingCount(node.id) === 0 ? requester : "";
+  }
+
+  function livePublicationCounts() {
+    return state.nodes.reduce((counts, node) => {
+      const requester = taskPublicationRequester(node);
+      if (requester) counts[requester] = (counts[requester] || 0) + 1;
+      return counts;
+    }, {});
+  }
+
+  function trackRequesterPublication(node) {
+    const requester = taskPublicationRequester(node);
+    if (!requester) return false;
+    const taskMap = countedRequesterTasks();
+    const previousRequester = String(taskMap[node.id] || "").trim();
+    if (previousRequester === requester) return false;
+    const stats = storedPersonStats();
+    if (previousRequester) {
+      stats[previousRequester] = Math.max(0, (Number(stats[previousRequester]) || 0) - 1);
+    }
+    stats[requester] = (Number(stats[requester]) || 0) + 1;
+    taskMap[node.id] = requester;
+    savePersonStats(stats);
+    saveCountedRequesterTasks(taskMap);
+    return true;
+  }
+
+  function syncRequesterPublicationStatsFromState() {
+    const taskMap = countedRequesterTasks();
+    const stats = storedPersonStats();
+    let changed = false;
+    state.nodes.forEach((node) => {
+      const requester = taskPublicationRequester(node);
+      if (!requester || taskMap[node.id] === requester) return;
+      const previousRequester = String(taskMap[node.id] || "").trim();
+      if (previousRequester) stats[previousRequester] = Math.max(0, (Number(stats[previousRequester]) || 0) - 1);
+      stats[requester] = (Number(stats[requester]) || 0) + 1;
+      taskMap[node.id] = requester;
+      changed = true;
+    });
+    if (!changed) return false;
+    savePersonStats(stats);
+    saveCountedRequesterTasks(taskMap);
+    return true;
+  }
+
+  function trackRequesterInputPublication(input) {
+    const inlineNodeId = input?.closest?.(".task-node")?.dataset.nodeId;
+    const editorNodeId = input?.closest?.("#editorContent") ? selectedNodeId : "";
+    const node = nodeById(inlineNodeId || editorNodeId);
+    return trackRequesterPublication(node);
+  }
+
+  function saveHiddenPeople(names) {
+    try {
+      localStorage.setItem(PEOPLE_HIDDEN_KEY, JSON.stringify(cleanPeople(names).slice(0, 100)));
+    } catch {
+      // 隐藏历史来源人只是辅助偏好，失败时不阻断任务编辑。
+    }
+  }
+
+  function savePeople(names, shouldRender = true) {
+    try {
+      localStorage.setItem(PEOPLE_KEY, JSON.stringify(cleanPeople(names).slice(0, 50)));
+    } catch {
+      // 来源人记忆只是辅助功能，存储空间不足时不阻断任务编辑。
+    }
+    if (shouldRender) renderPeopleUI();
+  }
+
+  function rememberPeople(values, options = {}) {
+    const cleanNames = cleanPeople(values);
+    if (!cleanNames.length) return;
+    const hidden = hiddenPeople().filter((name) => !cleanNames.includes(name));
+    saveHiddenPeople(hidden);
+    const current = knownPeople();
+    const merged = options.promote === false ? [...current, ...cleanNames] : [...cleanNames, ...current];
+    savePeople(merged, options.render !== false);
   }
 
   function rememberPerson(name) {
-    const cleanName = String(name || "").trim();
-    if (!cleanName) return;
-    const names = [...new Set([cleanName, ...knownPeople()])].slice(0, 50);
-    localStorage.setItem(PEOPLE_KEY, JSON.stringify(names));
-    renderPeopleSuggestions();
+    rememberPeople([name]);
+  }
+
+  function recentPerson() {
+    return knownPeople()[0] || "";
   }
 
   function renderPeopleSuggestions() {
     $("#peopleSuggestions").innerHTML = knownPeople().map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
+  }
+
+  function renderPeopleManager() {
+    if (!peopleList) return;
+    const people = knownPeople();
+    const count = $("#peopleCount");
+    const stats = storedPersonStats();
+    const liveCounts = livePublicationCounts();
+    const peopleWithCounts = people
+      .map((name, index) => ({
+        name,
+        index,
+        taskCount: Math.max(Number(stats[name]) || 0, Number(liveCounts[name]) || 0),
+      }))
+      .sort((a, b) => (b.taskCount - a.taskCount) || (a.index - b.index));
+    if (count) count.textContent = String(people.length);
+    peopleList.innerHTML = people.length
+      ? peopleWithCounts.map(({ name, taskCount }) => {
+        return `<div class="people-item"><span title="${escapeHtml(name)}">${escapeHtml(name)}</span><b class="people-publish-count" title="任务发布次数">${taskCount} 次</b><button type="button" data-delete-person="${escapeHtml(name)}" aria-label="删除 ${escapeHtml(name)}">删除</button></div>`;
+      }).join("")
+      : `<div class="people-empty">暂无历史来源人</div>`;
+  }
+
+  function renderPeopleUI() {
+    renderPeopleSuggestions();
+    renderPeopleManager();
+  }
+
+  function removeRememberedPerson(name) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    saveHiddenPeople([cleanName, ...hiddenPeople()]);
+    savePeople(storedPeople().filter((item) => item !== cleanName), false);
+    renderPeopleUI();
+    showToast(`已移除来源人「${cleanName}」`);
+  }
+
+  function isPersonInput(target) {
+    return Boolean(target?.matches?.(PERSON_INPUT_SELECTOR));
+  }
+
+  function personSuggestionBox() {
+    let box = $("#personSuggestionBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "personSuggestionBox";
+      box.className = "person-suggestion-box";
+      box.setAttribute("role", "listbox");
+      box.hidden = true;
+      document.body.appendChild(box);
+    }
+    return box;
+  }
+
+  function personSuggestionItems(input) {
+    const query = String(input?.value || "").trim().toLocaleLowerCase("zh-CN");
+    const people = knownPeople();
+    if (!query) return people.slice(0, 8);
+    const startsWith = [];
+    const includes = [];
+    people.forEach((name) => {
+      const lowerName = name.toLocaleLowerCase("zh-CN");
+      if (lowerName.startsWith(query)) startsWith.push(name);
+      else if (lowerName.includes(query)) includes.push(name);
+    });
+    return [...startsWith, ...includes].slice(0, 8);
+  }
+
+  function highlightedPersonName(name, query) {
+    const text = String(name || "");
+    const cleanQuery = String(query || "").trim();
+    if (!cleanQuery) return escapeHtml(text);
+    const lowerText = text.toLocaleLowerCase("zh-CN");
+    const lowerQuery = cleanQuery.toLocaleLowerCase("zh-CN");
+    const index = lowerText.indexOf(lowerQuery);
+    if (index < 0) return escapeHtml(text);
+    return `${escapeHtml(text.slice(0, index))}<mark>${escapeHtml(text.slice(index, index + cleanQuery.length))}</mark>${escapeHtml(text.slice(index + cleanQuery.length))}`;
+  }
+
+  function positionPersonSuggestionBox(input, box) {
+    const rect = input.getBoundingClientRect();
+    const width = Math.max(rect.width, 168);
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    const belowSpace = window.innerHeight - rect.bottom - 8;
+    const aboveSpace = rect.top - 8;
+    const maxHeight = Math.min(220, Math.max(112, Math.max(belowSpace, aboveSpace)));
+    box.style.left = `${left}px`;
+    box.style.width = `${width}px`;
+    box.style.maxHeight = `${maxHeight}px`;
+    if (belowSpace >= 112 || belowSpace >= aboveSpace) {
+      box.style.top = `${rect.bottom + 4}px`;
+      box.style.bottom = "auto";
+    } else {
+      box.style.top = "auto";
+      box.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+    }
+  }
+
+  function updatePersonSuggestionActive() {
+    const box = personSuggestionBox();
+    const options = $$("[data-person-suggestion]", box);
+    options.forEach((option, index) => {
+      const active = index === personSuggestionIndex;
+      option.classList.toggle("active", active);
+      option.setAttribute("aria-selected", String(active));
+      if (active) option.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function showPersonSuggestions(input) {
+    if (!isPersonInput(input) || input.readOnly || input.disabled) {
+      hidePersonSuggestions();
+      return;
+    }
+    renderPeopleSuggestions();
+    const items = personSuggestionItems(input);
+    const box = personSuggestionBox();
+    activePersonInput = input;
+    if (!items.length) {
+      hidePersonSuggestions();
+      return;
+    }
+    personSuggestionIndex = Math.min(Math.max(personSuggestionIndex, -1), items.length - 1);
+    const query = String(input.value || "").trim();
+    box.innerHTML = `<div class="person-suggestion-title">历史来源人</div>${items.map((name, index) => `
+      <button class="person-suggestion-option" type="button" role="option" data-person-suggestion="${escapeHtml(name)}" aria-selected="${index === personSuggestionIndex}">
+        <span>${highlightedPersonName(name, query)}</span>
+        <small>点击选择</small>
+      </button>
+    `).join("")}`;
+    positionPersonSuggestionBox(input, box);
+    box.hidden = false;
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-controls", "personSuggestionBox");
+    input.setAttribute("aria-expanded", "true");
+    updatePersonSuggestionActive();
+  }
+
+  function hidePersonSuggestions() {
+    const input = activePersonInput;
+    const box = personSuggestionBox();
+    box.hidden = true;
+    personSuggestionIndex = -1;
+    activePersonInput = null;
+    if (input) {
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+    }
+  }
+
+  function choosePersonSuggestion(name) {
+    const input = activePersonInput;
+    if (!input) return;
+    input.value = name;
+    rememberPerson(name);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    trackRequesterInputPublication(input);
+    hidePersonSuggestions();
+    input.focus();
   }
 
   function renderTemplates() {
@@ -796,7 +1364,7 @@
     templateList.innerHTML = templates.length ? templates.map((template) => {
       return `<article class="template-card">
         <div class="template-card-top"><h3 title="${escapeHtml(template.name || "未命名模板")}">${escapeHtml(template.name || "未命名模板")}</h3><span class="template-priority" title="优先级">${normalizePriority(template.priority)}</span></div>
-        <p class="template-card-meta">${escapeHtml(template.requester || "未填写来源人")} · 开始节点模板</p>
+        <p class="template-card-meta">开始节点模板 · 使用后填写任务来源人</p>
         <div class="template-card-actions">
           <button class="template-use-button" type="button" data-use-template="${escapeHtml(template.id)}">使用模板</button>
           <button class="template-delete-button" type="button" data-delete-template="${escapeHtml(template.id)}" aria-label="删除模板"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></svg></button>
@@ -806,13 +1374,28 @@
   }
 
   function renderAll() {
-    renderPeopleSuggestions();
+    renderPeopleUI();
     renderTemplates();
     renderNodes();
     renderEdges();
     renderView();
     renderLegend();
     updateSelectionVisuals();
+  }
+
+  function editableImageGalleryMarkup(node) {
+    const images = nodeImages(node);
+    if (!images.length) return "";
+    return `<div class="inline-image-gallery" aria-label="节点图片，共 ${images.length} 张">
+      ${images.map((image, index) => `<div class="inline-image-item">
+        <button class="inline-image-open" type="button" data-preview-node-images="${node.id}" data-image-index="${index}" aria-label="放大查看第 ${index + 1} 张图片">
+          <img src="${escapeHtml(image)}" alt="${escapeHtml(node.title)}的图片 ${index + 1}" />
+          <span class="inline-image-order">${index + 1} / ${images.length}</span>
+          <span class="inline-image-zoom-hint">点击放大</span>
+        </button>
+        <button class="inline-image-remove" type="button" data-remove-node-image="${node.id}" data-image-index="${index}" aria-label="移除第 ${index + 1} 张图片">×</button>
+      </div>`).join("")}
+    </div>`;
   }
 
   function renderNodes() {
@@ -825,13 +1408,15 @@
       const isChild = nodeType !== "start";
       const displayTitle = isChild ? chainTaskName(node.id) : node.title;
       const priority = effectivePriority(node.id);
-      const isEditing = selectedNodeId === node.id;
+      const isEditing = isInlineEditingNode(node.id);
+      const isPinnedEditing = pinnedInlineNodeIds.has(node.id);
       const goalExpanded = expandedGoalNodes.has(node.id);
       const hasBranches = outgoingCount(node.id) > 0;
-      const branchCollapsed = collapsedBranchNodes.has(node.id);
+      const branchCollapsed = isBranchCollapsed(node.id);
       const displayDate = node.status === "done" && node.completedAt ? node.completedAt : (node.date || isoDate(new Date()));
+      const images = nodeImages(node);
       return `
-        <article class="task-node node-status-${node.status} type-${nodeType}${isEditing ? " selected inline-editing" : ""}${multiSelectedNodeIds.has(node.id) ? " multi-selected" : ""}" data-node-id="${node.id}" style="left:${node.x}px;top:${node.y}px">
+        <article class="task-node node-status-${node.status} type-${nodeType}${isEditing ? " selected inline-editing" : ""}${isPinnedEditing ? " inline-pinned" : ""}${multiSelectedNodeIds.has(node.id) ? " multi-selected" : ""}" data-node-id="${node.id}" style="left:${node.x}px;top:${node.y}px">
           <button class="node-chain-label" data-toggle-goal="${node.id}" title="点击展开或折叠链目标">${icons.link}<span>链目标 · ${escapeHtml(truncate(chainGoal(node.id), 26))}</span><b>${goalExpanded ? "⌃" : "⌄"}</b></button>
           ${goalExpanded ? `<div class="chain-goal-expanded"><strong>${escapeHtml(chainTaskName(node.id))}</strong><p>${escapeHtml(chainGoal(node.id))}</p>${chainProgressMarkup(node.id)}</div>` : ""}
           <div class="node-card${isEditing ? " inline-edit-card" : ""}">
@@ -840,7 +1425,7 @@
             <button class="node-handle output${hasBranches ? " has-branch" : ""}${branchCollapsed ? " branch-collapsed" : ""}" data-handle="output" aria-label="${hasBranches ? (branchCollapsed ? "展开后续支线" : "折叠后续支线") : "拖动创建后续连接"}" title="${hasBranches ? "单击折叠/展开支线，拖动创建连线" : "拖动创建后续连线"}"></button>
             <header class="node-header">
               <div class="node-type node-header-requester" title="任务来源人"><span class="node-type-icon">${icons.person}</span>${escapeHtml(requester)}</div>
-              <div class="node-header-actions"><span class="priority-badge${priority === 0 ? " priority-zero" : ""}" title="优先级 ${priority}">${priority}</span><button class="node-menu-button edit-node-button" ${isEditing ? `data-close-inline="${node.id}"` : `data-node-menu="${node.id}"`} aria-label="${isEditing ? "完成编辑" : "修改节点"}">${isEditing ? "✓" : icons.pencil}</button></div>
+              <div class="node-header-actions"><span class="priority-badge${priority === 0 ? " priority-zero" : ""}" title="优先级 ${priority}">${priority}</span><button class="node-menu-button edit-node-button${isEditing ? " inline-pin-button" : ""}${isPinnedEditing ? " inline-pin-active" : ""}" ${isEditing ? `data-toggle-inline-pin="${node.id}" aria-pressed="${isPinnedEditing}"` : `data-node-menu="${node.id}"`} aria-label="${isEditing ? (isPinnedEditing ? "取消固定编辑" : "固定显示编辑") : "修改节点"}" title="${isEditing ? (isPinnedEditing ? "取消固定编辑" : "固定显示编辑") : "修改节点"}">${isEditing ? icons.pin : icons.pencil}</button></div>
             </header>
             ${isEditing ? inlineEditorMarkup(node, isChild) : `<div class="node-body">
               <div class="node-content-row">
@@ -849,7 +1434,7 @@
                   ${nodeType === "start" ? `<p class="node-goal" title="${escapeHtml(node.goal || "暂未填写任务目标")}"><strong>目标</strong> ${escapeHtml(node.goal || "暂未填写任务目标")}</p>` : ""}
                   ${isChild ? `<p class="node-chain-name" title="${escapeHtml(displayTitle)}">任务 · ${escapeHtml(displayTitle)}</p>` : ""}
                 </div>
-                ${node.image ? `<img class="node-product-image" src="${escapeHtml(node.image)}" alt="${escapeHtml(node.title)}的图片" />` : ""}
+                ${images.length ? `<button class="node-image-summary" type="button" data-preview-node-images="${node.id}" data-image-index="0" aria-label="查看节点图片，共 ${images.length} 张"><img class="node-product-image" src="${escapeHtml(images[0])}" alt="${escapeHtml(node.title)}的图片" />${images.length > 1 ? `<span>+${images.length - 1}</span>` : ""}</button>` : ""}
               </div>
             </div>
             <footer class="node-footer">
@@ -869,45 +1454,70 @@
     const nodeType = derivedType(node.id);
     const displayTitle = isChild ? chainTaskName(node.id) : node.title;
     const requester = effectiveRequester(node.id);
-    return `<div class="inline-node-editor">
-      <label class="inline-field inline-field-wide"><span>任务名称${isChild ? " · 跟随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : `data-inline-field="title"`} value="${escapeHtml(displayTitle)}" /></label>
+    const images = nodeImages(node);
+    return `<div class="inline-node-editor" spellcheck="false" autocorrect="off" autocapitalize="off">
+      <label class="inline-field inline-field-wide" data-required-field="title"><span>任务名称${isChild ? " · 跟随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : `data-inline-field="title"`} value="${escapeHtml(displayTitle)}" placeholder="请输入任务名称" aria-required="true" spellcheck="false" /><small class="inline-field-error">任务名称不能为空</small></label>
       <div class="inline-field-row">
-        <label class="inline-field"><span>需求来源人${isChild ? " · 随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : 'data-inline-field="requester" list="peopleSuggestions"'} value="${escapeHtml(requester)}" placeholder="姓名" /></label>
+        <label class="inline-field" data-required-field="requester"><span>需求来源人${isChild ? " · 随开始节点" : ""}</span><input class="inline-input" ${isChild ? "readonly" : 'data-inline-field="requester" data-person-input="true" autocomplete="off"'} value="${escapeHtml(requester)}" placeholder="请输入任务来源人" aria-required="true" spellcheck="false" /><small class="inline-field-error">任务来源人不能为空</small></label>
         <label class="inline-field"><span>优先级${nodeType === "start" ? "" : " · 随链路"}</span><input class="inline-input inline-priority-input" type="number" min="0" max="10" step="1" ${nodeType === "start" ? 'data-inline-field="priority"' : "readonly"} value="${effectivePriority(node.id)}" /></label>
       </div>
-      <label class="inline-field inline-field-wide"><span>任务状态</span><select class="inline-select" data-inline-field="status">${statusOptions(node.status)}</select></label>
-      ${nodeType === "start" ? `<label class="inline-field inline-field-wide"><span>任务目标 / 要求</span><textarea class="inline-textarea" data-inline-field="goal" placeholder="填写任务目标">${escapeHtml(node.goal)}</textarea></label>` : ""}
-      ${nodeType === "start" ? "" : `<label class="inline-field inline-field-wide"><span>当前进展 / 卡点说明</span><textarea class="inline-textarea" data-inline-field="note" placeholder="记录进展或卡点">${escapeHtml(node.note)}</textarea></label>`}
+      ${nodeType === "start" ? `<label class="inline-field inline-field-wide"><span>任务目标 / 要求</span><textarea class="inline-textarea" data-inline-field="goal" placeholder="填写任务目标" spellcheck="false">${escapeHtml(node.goal)}</textarea></label>` : ""}
+      ${nodeType === "start" ? "" : `<label class="inline-field inline-field-wide"><span>当前进展 / 卡点说明</span><textarea class="inline-textarea" data-inline-field="note" placeholder="记录进展或卡点" spellcheck="false">${escapeHtml(node.note)}</textarea></label>`}
+      <label class="inline-image-dropzone" for="inlineImage-${node.id}">
+        <span class="inline-image-dropzone-icon">${icons.image}</span>
+        <span><strong>${images.length ? "继续添加图片" : "添加图片"}</strong><small>点击选择图片，或在上方文本框 Ctrl + V 粘贴图片</small></span>
+      </label>
+      <input class="inline-image-input" id="inlineImage-${node.id}" data-node-image="${node.id}" type="file" accept="image/*" multiple hidden />
+      ${editableImageGalleryMarkup(node)}
       <div class="inline-editor-footer">
         <button class="inline-action template-create-action" data-create-template="${node.id}" type="button">${icons.template}创建模板</button>
-        <label class="inline-image-button" for="inlineImage-${node.id}">${icons.image}${node.image ? "更换图片" : "添加图片"}</label>
-        <input class="inline-image-input" id="inlineImage-${node.id}" data-node-image="${node.id}" type="file" accept="image/*" hidden />
-        ${node.image ? `<img class="inline-image-preview" src="${escapeHtml(node.image)}" alt="节点图片" /><button class="inline-action danger" data-remove-inline-image="${node.id}" type="button">移除图片</button>` : ""}
         <button class="inline-action danger" data-delete-inline="${node.id}" type="button">删除节点</button>
       </div>
     </div>`;
   }
 
-  function edgePath(fromNode, toNode) {
+  function edgeGeometry(fromNode, toNode) {
     const x1 = fromNode.x + NODE_WIDTH;
     const y1 = fromNode.y + NODE_CARD_TOP + cardHeightFor(fromNode) / 2;
     const x2 = toNode.x;
     const y2 = toNode.y + NODE_CARD_TOP + cardHeightFor(toNode) / 2;
     const gap = x2 - x1;
     const distance = gap >= 0 ? Math.max(24, Math.min(160, gap * 0.45)) : Math.max(100, Math.abs(gap) * 0.55);
-    return `M ${x1} ${y1} C ${x1 + distance} ${y1}, ${x2 - distance} ${y2}, ${x2} ${y2}`;
+    return {
+      x1,
+      y1,
+      x2,
+      y2,
+      path: `M ${x1} ${y1} C ${x1 + distance} ${y1}, ${x2 - distance} ${y2}, ${x2} ${y2}`,
+    };
+  }
+
+  function nodeEdgeColor(node) {
+    return statusMeta[node?.status]?.color || statusMeta.todo.color;
   }
 
   function renderEdges() {
     const visible = displayedNodeIds();
-    edgePaths.innerHTML = state.edges.filter((edge) => visible.has(edge.from) && visible.has(edge.to)).map((edge) => {
+    edgePaths.innerHTML = state.edges.filter((edge) => visible.has(edge.from) && visible.has(edge.to)).map((edge, index) => {
       const from = nodeById(edge.from);
       const to = nodeById(edge.to);
       if (!from || !to) return "";
-      const path = edgePath(from, to);
+      const geometry = edgeGeometry(from, to);
+      const gradientId = `edge-gradient-${index}`;
+      const arrowId = `edge-arrow-${index}`;
+      const fromColor = nodeEdgeColor(from);
+      const toColor = nodeEdgeColor(to);
       const active = selectedNodeId && (edge.from === selectedNodeId || edge.to === selectedNodeId);
       const completed = to.status === "done";
-      return `<path class="edge-underlay" d="${path}"></path><path class="edge-path${completed ? " completed" : ""}${active ? " active" : ""}" d="${path}"></path><path class="edge-shadow" d="${path}" data-edge-id="${edge.id}"></path>`;
+      return `<defs>
+        <linearGradient id="${gradientId}" gradientUnits="userSpaceOnUse" x1="${geometry.x1}" y1="${geometry.y1}" x2="${geometry.x2}" y2="${geometry.y2}">
+          <stop offset="0%" style="stop-color:${fromColor}"></stop>
+          <stop offset="100%" style="stop-color:${toColor}"></stop>
+        </linearGradient>
+        <marker id="${arrowId}" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0 0 8 4 0 8Z" style="fill:${toColor}"></path>
+        </marker>
+      </defs><path class="edge-underlay" d="${geometry.path}"></path><path class="edge-path${completed ? " completed" : ""}${active ? " active" : ""}" d="${geometry.path}" style="stroke:url(#${gradientId});marker-end:url(#${arrowId})"></path><path class="edge-shadow" d="${geometry.path}" data-edge-id="${edge.id}"></path>`;
     }).join("");
   }
 
@@ -941,15 +1551,16 @@
       return;
     }
     const chain = connectedNodes(node.id).filter((item) => item.goal);
+    const images = nodeImages(node);
     editorContent.innerHTML = `
       <div class="editor-topline"><span class="editor-kicker">NODE DETAIL</span><button class="editor-close" id="editorClose" aria-label="关闭">×</button></div>
       <h2 class="editor-title">编辑任务节点</h2>
       <div class="editor-section">
         <div class="editor-section-title">基础信息 <span>自动保存</span></div>
         <label class="field-label" for="editTitle">任务名称</label>
-        <input class="text-input" id="editTitle" data-field="title" value="${escapeHtml(node.title)}" />
+        <input class="text-input" id="editTitle" data-field="title" value="${escapeHtml(node.title)}" spellcheck="false" />
         <label class="field-label" for="editRequester">需求来源人</label>
-        <input class="text-input" id="editRequester" data-field="requester" list="peopleSuggestions" value="${escapeHtml(node.requester)}" placeholder="输入姓名，可选择历史记录" />
+        <input class="text-input" id="editRequester" data-field="requester" data-person-input="true" autocomplete="off" value="${escapeHtml(node.requester)}" placeholder="输入姓名，可选择历史记录" spellcheck="false" />
         <div class="form-row">
           <div><label class="field-label" for="editType">节点类型</label><select class="select-input" id="editType" data-field="type">${typeOptions(node.type)}</select></div>
           <div><label class="field-label" for="editStatus">任务状态</label><select class="select-input" id="editStatus" data-field="status">${statusOptions(node.status)}</select></div>
@@ -958,19 +1569,18 @@
       <div class="editor-section">
         <div class="editor-section-title">目标与进展</div>
         <label class="field-label" for="editGoal">任务目标 / 要求</label>
-        <textarea class="text-area" id="editGoal" data-field="goal">${escapeHtml(node.goal)}</textarea>
+        <textarea class="text-area" id="editGoal" data-field="goal" spellcheck="false">${escapeHtml(node.goal)}</textarea>
         <label class="field-label" for="editNote">当前进展 / 卡点说明</label>
-        <textarea class="text-area" id="editNote" data-field="note" placeholder="记录做到哪一步；有卡点时直接说明原因">${escapeHtml(node.note)}</textarea>
+        <textarea class="text-area" id="editNote" data-field="note" placeholder="记录做到哪一步；有卡点时直接说明原因" spellcheck="false">${escapeHtml(node.note)}</textarea>
       </div>
       <div class="editor-section">
-        <div class="editor-section-title">产品 / 型号图片 <span>${node.image ? "已上传" : "可选"}</span></div>
-        <div class="editor-image-box ${node.image ? "has-image" : ""}">
-          ${node.image ? `<img src="${escapeHtml(node.image)}" alt="${escapeHtml(node.title)}的图片" />` : `<div class="editor-image-placeholder">${icons.image}<span>添加图片后会直接显示在节点上</span></div>`}
+        <div class="editor-section-title">产品 / 型号图片 <span>${images.length ? `${images.length} 张` : "可选"}</span></div>
+        <div class="editor-image-box ${images.length ? "has-image" : ""}">
+          ${images.length ? editableImageGalleryMarkup(node) : `<div class="editor-image-placeholder">${icons.image}<span>可添加多张图片，点击图片可放大查看</span></div>`}
           <div class="editor-image-actions">
-            <label class="button button-ghost" for="editNodeImage">${node.image ? "更换图片" : "上传图片"}</label>
-            ${node.image ? '<button class="button button-ghost image-remove-button" id="removeNodeImage" type="button">移除</button>' : ""}
+            <label class="button button-ghost" for="editNodeImage">${images.length ? "继续添加图片" : "上传图片"}</label>
           </div>
-          <input id="editNodeImage" type="file" accept="image/*" hidden />
+          <input id="editNodeImage" type="file" accept="image/*" multiple hidden />
         </div>
       </div>
       <div class="editor-section">
@@ -990,25 +1600,78 @@
 
   function cardHeightFor(node) {
     const card = $(`[data-node-id="${node.id}"] .node-card`, nodesLayer);
-    return card?.offsetHeight || (selectedNodeId === node.id ? INLINE_CARD_HEIGHT : NODE_CARD_HEIGHT);
+    return card?.offsetHeight || (isInlineEditingNode(node.id) ? INLINE_CARD_HEIGHT : NODE_CARD_HEIGHT);
+  }
+
+  function validateInlineRequiredFields(node) {
+    if (!node || derivedType(node.id) !== "start") return true;
+    const nodeEl = $(`[data-node-id="${node.id}"]`, nodesLayer);
+    const missingFields = ["title", "requester"].filter((field) => !String(node[field] || "").trim());
+    ["title", "requester"].forEach((field) => {
+      const fieldEl = nodeEl?.querySelector(`[data-required-field="${field}"]`);
+      const input = fieldEl?.querySelector(".inline-input");
+      const hasError = missingFields.includes(field);
+      fieldEl?.classList.toggle("has-error", hasError);
+      input?.setAttribute("aria-invalid", String(hasError));
+    });
+    if (!missingFields.length) return true;
+    nodeEl?.classList.remove("validation-shake");
+    if (nodeEl) void nodeEl.offsetWidth;
+    nodeEl?.classList.add("validation-shake");
+    setTimeout(() => nodeEl?.classList.remove("validation-shake"), 520);
+    nodeEl?.querySelector(`[data-required-field="${missingFields[0]}"] .inline-input:not([readonly])`)?.focus();
+    return false;
+  }
+
+  function clearInlineFieldError(target, field) {
+    if (!target || !["title", "requester"].includes(field) || !String(target.value || "").trim()) return;
+    const fieldEl = target.closest(`[data-required-field="${field}"]`);
+    fieldEl?.classList.remove("has-error");
+    target.setAttribute("aria-invalid", "false");
+  }
+
+  function fillGoalFromTitleIfBlank(node) {
+    const title = String(node?.title || "").trim();
+    if (!node || !title || String(node.goal || "").trim()) return false;
+    node.goal = title;
+    return true;
+  }
+
+  function syncGoalFromTitleIfBlankOrSynced(node, nextTitle, previousTitle) {
+    const title = String(nextTitle || "").trim();
+    const goal = String(node?.goal || "");
+    const previous = String(previousTitle || "").trim();
+    if (!node || !title || (goal.trim() && goal.trim() !== previous)) return false;
+    node.goal = title;
+    return true;
   }
 
   function finalizeInlineEdit(id = selectedNodeId) {
     const node = nodeById(id);
-    if (!node || !String(node.title || "").trim() || String(node.goal || "").trim()) return false;
-    pushUndoSnapshot();
-    node.goal = node.title;
+    if (!node) return true;
+    if (!validateInlineRequiredFields(node)) return false;
+    if (fillGoalFromTitleIfBlank(node)) {
+      const goalInput = $(`[data-node-id="${node.id}"] [data-inline-field="goal"]`, nodesLayer);
+      if (goalInput) {
+        goalInput.value = node.goal;
+        goalInput.style.height = "auto";
+        goalInput.style.height = `${goalInput.scrollHeight}px`;
+      }
+    }
+    rememberPerson(node.requester);
+    trackRequesterPublication(node);
     saveState();
     return true;
   }
 
   function selectNode(id) {
-    if (selectedNodeId && selectedNodeId !== id) finalizeInlineEdit(selectedNodeId);
+    if (selectedNodeId && selectedNodeId !== id && !pinnedInlineNodeIds.has(selectedNodeId) && !finalizeInlineEdit(selectedNodeId)) return false;
     selectedNodeId = id;
     multiSelectedNodeIds.clear();
     multiSelectedNodeIds.add(id);
     renderNodes();
     renderEdges();
+    return true;
   }
 
   function canvasPoint(clientX, clientY) {
@@ -1019,14 +1682,34 @@
     };
   }
 
+  function nodePositionNearPoint(point) {
+    return {
+      x: point.x + 24,
+      y: point.y - NODE_CARD_TOP - NODE_CARD_HEIGHT / 2,
+    };
+  }
+
+  function isPointerOutsideViewport(event) {
+    return event.clientX < 0 || event.clientY < 0 || event.clientX > window.innerWidth || event.clientY > window.innerHeight;
+  }
+
+  function stopCanvasPan() {
+    if (!panSession) return;
+    saveState();
+    panSession = null;
+    canvas.classList.remove("panning");
+  }
+
   function openNodeModal(position) {
     pendingNodePosition = position || visibleCenterPoint();
-    pendingImageData = "";
+    pendingImageData = [];
+    renderPeopleSuggestions();
     $("#nodeForm").reset();
     $("#newImagePreview").hidden = true;
     $("#newImagePreview").removeAttribute("src");
     $("#newNodeType").value = "task";
     $("#newNodeStatus").value = "todo";
+    $("#newNodeRequester").value = recentPerson();
     $("#nodeModal").hidden = false;
     setTimeout(() => $("#newNodeTitle").focus(), 20);
   }
@@ -1043,6 +1726,7 @@
   function createNode(data, position, connectFrom = null) {
     pushUndoSnapshot();
     const id = `n${Date.now().toString(36)}`;
+    const images = normalizeImageList(data.images, data.image);
     const node = {
       id,
       x: Math.round(position.x),
@@ -1054,7 +1738,8 @@
       requester: String(data.requester || "").trim(),
       goal: data.goal || "",
       note: data.note || "等待开始",
-      image: data.image || "",
+      image: images[0] || "",
+      images,
       date: isoDate(new Date()),
       completedAt: normalizeCompletionDate(data.completedAt) || ((data.status || "todo") === "done" ? isoDate(new Date()) : ""),
     };
@@ -1063,6 +1748,7 @@
     if (connectFrom && canConnect(nodeById(connectFrom), node)) {
       state.edges.push({ id: `e${Date.now().toString(36)}`, from: connectFrom, to: id });
     }
+    trackRequesterPublication(node);
     saveState();
     selectedNodeId = null;
     renderAll();
@@ -1078,6 +1764,8 @@
       x: source.x + 24,
       y: source.y + 24,
       title: `${source.title}（副本）`,
+      image: nodeImages(source)[0] || "",
+      images: [...nodeImages(source)],
       date: isoDate(new Date()),
     };
     state.nodes.push(duplicate);
@@ -1112,27 +1800,61 @@
     });
   }
 
-  function addImageToNode(node, file) {
-    if (!node || !file) return Promise.resolve(false);
-    return compressImage(file).then((imageData) => {
+  async function addImagesToNode(node, files) {
+    const imageFiles = Array.from(files || []).filter((file) => file?.type?.startsWith("image/"));
+    if (!node || !imageFiles.length) return false;
+    const previousImages = nodeImages(node);
+    const availableCount = MAX_NODE_IMAGES - previousImages.length;
+    if (availableCount <= 0) {
+      showToast(`每个节点最多添加 ${MAX_NODE_IMAGES} 张图片`);
+      return false;
+    }
+    const acceptedFiles = imageFiles.slice(0, availableCount);
+    try {
+      const addedImages = await Promise.all(acceptedFiles.map((file) => compressImage(file)));
       pushUndoSnapshot();
-      node.image = imageData;
-      saveState();
+      setNodeImages(node, [...previousImages, ...addedImages]);
+      if (!saveState()) {
+        setNodeImages(node, previousImages);
+        return false;
+      }
       renderAll();
-      showToast("图片已添加到节点");
+      const limitNotice = imageFiles.length > acceptedFiles.length ? `，单节点最多 ${MAX_NODE_IMAGES} 张` : "";
+      showToast(`已添加 ${addedImages.length} 张图片${limitNotice}`);
       return true;
-    }).catch((error) => {
+    } catch (error) {
       showToast(error.message);
       return false;
-    });
+    }
   }
 
-  function pastedImageFile(clipboardData) {
-    const itemFile = Array.from(clipboardData?.items || [])
-      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
-      ?.getAsFile();
-    return itemFile || Array.from(clipboardData?.files || [])
-      .find((file) => file.type.startsWith("image/")) || null;
+  function addImageToNode(node, file) {
+    return addImagesToNode(node, file ? [file] : []);
+  }
+
+  function pastedImageFiles(clipboardData) {
+    const itemFiles = Array.from(clipboardData?.items || [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (itemFiles.length) return itemFiles;
+    return Array.from(clipboardData?.files || [])
+      .filter((file) => file.type.startsWith("image/"));
+  }
+
+  function nodeForImagePasteTarget(target) {
+    if (target?.closest?.(".modal-backdrop, .image-lightbox")) return null;
+    const inlineNodeEl = target?.closest?.(".task-node.inline-editing");
+    if (inlineNodeEl) return nodeById(inlineNodeEl.dataset.nodeId);
+    if (editorContent.contains(target) && selectedNodeId) return nodeById(selectedNodeId);
+    const outsideTypingTarget = target?.matches?.("input, textarea, select, [contenteditable='true']")
+      && !target.closest?.(".inline-node-editor")
+      && !editorContent.contains(target);
+    if (outsideTypingTarget) return null;
+    const selectedInlineNode = selectedNodeId ? $(`.task-node.inline-editing[data-node-id="${selectedNodeId}"]`, nodesLayer) : null;
+    if (selectedInlineNode) return nodeById(selectedNodeId);
+    const visiblePinnedIds = [...pinnedInlineNodeIds].filter((id) => $(`.task-node.inline-editing[data-node-id="${id}"]`, nodesLayer));
+    return visiblePinnedIds.length === 1 ? nodeById(visiblePinnedIds[0]) : null;
   }
 
   function deleteNodes(ids) {
@@ -1142,7 +1864,9 @@
     state.nodes = state.nodes.filter((node) => !nodeIds.has(node.id));
     state.edges = state.edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
     nodeIds.forEach((id) => {
+      pinnedInlineNodeIds.delete(id);
       collapsedBranchNodes.delete(id);
+      autoCollapsedBranchNodes.delete(id);
       expandedGoalNodes.delete(id);
       multiSelectedNodeIds.delete(id);
     });
@@ -1275,7 +1999,7 @@
       return isoDate(start);
     })();
     const completedInPeriod = (node) => node.status === "done" && node.completedAt && node.completedAt >= periodStart && node.completedAt <= today;
-    const componentLines = (component, predicate) => {
+    const componentLines = (component, predicate, { markCompleted = false } = {}) => {
       const relevant = component.filter(predicate).sort((a, b) => a.x - b.x || a.y - b.y);
       if (!relevant.length) return [];
       const start = chainStart(component[0].id) || component[0];
@@ -1291,7 +2015,8 @@
       const startBlocker = relevant.includes(start) && start.status === "blocked"
         ? `｜卡点：${compact(start.note) || compact(start.title) || "未填写"}`
         : "";
-      const lines = [`${requester}｜${chainTaskName(start.id)}${startBlocker}`];
+      const completionSuffix = markCompleted ? "｜已完成" : "";
+      const lines = [`${requester}｜${chainTaskName(start.id)}${startBlocker}${completionSuffix}`];
       const relevantIds = new Set(relevant.map((node) => node.id));
       const descendantMemo = new Map();
       const hasRelevantDescendant = (nodeId, visiting = new Set()) => {
@@ -1313,7 +2038,7 @@
             const label = child.status === "blocked"
               ? `卡点：${compact(child.note) || compact(child.title) || "未填写"}`
               : compact(child.note) || child.title;
-            lines.push(`${"  ".repeat(depth)}- ${label}`);
+            lines.push(`${"  ".repeat(depth)}- ${label}${markCompleted ? "｜已完成" : ""}`);
             rendered.add(child.id);
           }
           appendChildren(child.id, showChild ? depth + 1 : depth, nextVisiting);
@@ -1326,13 +2051,19 @@
         const label = node.status === "blocked"
           ? `卡点：${compact(node.note) || compact(node.title) || "未填写"}`
           : compact(node.note) || node.title;
-        lines.push(`  - ${label}`);
+        lines.push(`  - ${label}${markCompleted ? "｜已完成" : ""}`);
         rendered.add(node.id);
       });
       return lines;
     };
     const components = chainComponents().sort(reportSort);
-    const completed = components.flatMap((component) => componentLines(component, completedInPeriod));
+    const completed = components.flatMap((component) => {
+      const start = chainStart(component[0]?.id) || component[0];
+      const completedAsChain = component.every((node) => node.status === "done") && completedInPeriod(start);
+      return completedAsChain
+        ? componentLines(component, () => true, { markCompleted: component.length > 1 })
+        : componentLines(component, completedInPeriod);
+    });
     const unfinished = components.flatMap((component) => componentLines(component, (node) => node.status !== "done"));
     const completedTitle = period === "day" ? "一、今天完成" : "一、本期完成";
 
@@ -1363,6 +2094,287 @@
     showToast("报告已导出");
   }
 
+  function visibleCanvasSnapshotBounds() {
+    const nodes = $$("#nodesLayer .task-node");
+    if (!nodes.length) return null;
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    nodes.forEach((node) => {
+      const x = Number.parseFloat(node.style.left) || node.offsetLeft || 0;
+      const y = Number.parseFloat(node.style.top) || node.offsetTop || 0;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x + (node.offsetWidth || NODE_WIDTH));
+      bottom = Math.max(bottom, y + (node.offsetHeight || NODE_CARD_TOP + NODE_CARD_HEIGHT));
+    });
+    try {
+      const edgeBox = edgePaths.getBBox();
+      if (edgeBox.width || edgeBox.height) {
+        left = Math.min(left, edgeBox.x);
+        top = Math.min(top, edgeBox.y);
+        right = Math.max(right, edgeBox.x + edgeBox.width);
+        bottom = Math.max(bottom, edgeBox.y + edgeBox.height);
+      }
+    } catch {
+      // Empty SVG groups can fail getBBox; node bounds are enough in that case.
+    }
+    const width = world.offsetWidth || 4000;
+    const height = world.offsetHeight || 2400;
+    const paddedLeft = Math.max(0, Math.floor(left - SNAPSHOT_PADDING));
+    const paddedTop = Math.max(0, Math.floor(top - SNAPSHOT_PADDING));
+    const paddedRight = Math.min(width, Math.ceil(right + SNAPSHOT_PADDING));
+    const paddedBottom = Math.min(height, Math.ceil(bottom + SNAPSHOT_PADDING));
+    return {
+      left: paddedLeft,
+      top: paddedTop,
+      width: Math.max(1, paddedRight - paddedLeft),
+      height: Math.max(1, paddedBottom - paddedTop),
+    };
+  }
+
+  function snapshotScaleFor(width, height) {
+    const dimensionScale = SNAPSHOT_MAX_DIMENSION / Math.max(width, height);
+    const pixelScale = Math.sqrt(SNAPSHOT_MAX_PIXELS / Math.max(1, width * height));
+    return Math.max(1, Math.min(SNAPSHOT_TARGET_SCALE, dimensionScale, pixelScale));
+  }
+
+  function canvasToPngBlob(canvas) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error("无法生成快照图片"));
+      }, "image/png", 1);
+    });
+  }
+
+  function loadSnapshotImage(url) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("快照图片渲染失败"));
+      image.src = url;
+    });
+  }
+
+  function snapshotPalette() {
+    const styles = getComputedStyle(document.documentElement);
+    const color = (name) => styles.getPropertyValue(name).trim();
+    return {
+      bg: color("--bg"),
+      surface: color("--surface-solid"),
+      surfaceSoft: color("--surface-soft"),
+      line: color("--line"),
+      lineStrong: color("--line-strong"),
+      ink: color("--ink"),
+      muted: color("--muted"),
+      grid: color("--grid"),
+      accent: color("--accent"),
+      accentSoft: color("--accent-soft"),
+      todo: color("--todo"),
+      todoSoft: color("--todo-soft"),
+      doing: color("--doing"),
+      doingSoft: color("--doing-soft"),
+      blocked: color("--blocked"),
+      blockedSoft: color("--blocked-soft"),
+      done: color("--done"),
+      doneSoft: color("--done-soft"),
+      doneCard: color("--done-card"),
+      doneCardStrong: color("--done-card-strong"),
+      doneInk: color("--done-ink"),
+      doneMuted: color("--done-muted"),
+      font: styles.fontFamily,
+    };
+  }
+
+  function snapshotStatusColors(status, palette) {
+    const map = {
+      todo: { color: palette.todo, soft: palette.todoSoft },
+      doing: { color: palette.doing, soft: palette.doingSoft },
+      blocked: { color: palette.blocked, soft: palette.blockedSoft },
+      done: { color: palette.done, soft: palette.doneSoft },
+    };
+    return map[status] || map.todo;
+  }
+
+  function snapshotWrapText(value, maxChars, maxLines) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return [];
+    const chars = Array.from(text);
+    const lines = [];
+    let index = 0;
+    while (index < chars.length && lines.length < maxLines) {
+      let line = chars.slice(index, index + maxChars).join("");
+      index += maxChars;
+      if (index < chars.length && lines.length === maxLines - 1) line = `${line.slice(0, Math.max(1, line.length - 1))}…`;
+      lines.push(line);
+    }
+    return lines;
+  }
+
+  function snapshotText(lines, x, y, options = {}) {
+    const values = Array.isArray(lines) ? lines : [lines];
+    const size = options.size || 12;
+    const lineHeight = options.lineHeight || Math.round(size * 1.45);
+    const weight = options.weight || 500;
+    const color = options.color || "currentColor";
+    return `<text x="${x}" y="${y}" fill="${escapeHtml(color)}" font-size="${size}" font-weight="${weight}" font-family="inherit">${values.map((line, index) => `<tspan x="${x}" dy="${index ? lineHeight : 0}">${escapeHtml(line)}</tspan>`).join("")}</text>`;
+  }
+
+  function snapshotEdgeGeometry(fromNode, toNode, bounds) {
+    const x1 = fromNode.x + NODE_WIDTH - bounds.left;
+    const y1 = fromNode.y + NODE_CARD_TOP + cardHeightFor(fromNode) / 2 - bounds.top;
+    const x2 = toNode.x - bounds.left;
+    const y2 = toNode.y + NODE_CARD_TOP + cardHeightFor(toNode) / 2 - bounds.top;
+    const gap = x2 - x1;
+    const distance = gap >= 0 ? Math.max(24, Math.min(160, gap * 0.45)) : Math.max(100, Math.abs(gap) * 0.55);
+    return {
+      x1,
+      y1,
+      x2,
+      y2,
+      path: `M ${x1} ${y1} C ${x1 + distance} ${y1}, ${x2 - distance} ${y2}, ${x2} ${y2}`,
+    };
+  }
+
+  function snapshotImageMarkup(node, x, y, palette) {
+    const images = nodeImages(node).filter((image) => image.startsWith("data:"));
+    if (!images.length) return "";
+    const size = 48;
+    const imageX = x + NODE_WIDTH - size - 15;
+    const imageY = y + 60;
+    return `<clipPath id="clip-${escapeHtml(node.id)}"><rect x="${imageX}" y="${imageY}" width="${size}" height="${size}" rx="8"></rect></clipPath>
+      <rect x="${imageX}" y="${imageY}" width="${size}" height="${size}" rx="8" fill="${escapeHtml(palette.surfaceSoft)}" stroke="${escapeHtml(palette.lineStrong)}"></rect>
+      <image href="${escapeHtml(images[0])}" x="${imageX}" y="${imageY}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#clip-${escapeHtml(node.id)})"></image>
+      ${images.length > 1 ? `<rect x="${imageX + size - 25}" y="${imageY + size - 18}" width="23" height="16" rx="5" fill="rgba(25,30,27,.72)"></rect>${snapshotText(`+${images.length - 1}`, imageX + size - 20, imageY + size - 6, { size: 9, weight: 800, color: "#fff" })}` : ""}`;
+  }
+
+  function snapshotNodeMarkup(node, bounds, palette) {
+    const statusColors = snapshotStatusColors(node.status, palette);
+    const nodeType = derivedType(node.id);
+    const isChild = nodeType !== "start";
+    const x = node.x - bounds.left;
+    const y = node.y - bounds.top;
+    const cardY = y + NODE_CARD_TOP;
+    const height = Math.max(NODE_CARD_HEIGHT, cardHeightFor(node));
+    const isDone = node.status === "done";
+    const cardFill = isDone ? palette.doneCard : palette.surface;
+    const cardFillBottom = isDone ? palette.doneCardStrong : palette.surface;
+    const textColor = isDone ? palette.doneInk : palette.ink;
+    const mutedColor = isDone ? palette.doneMuted : palette.muted;
+    const title = isChild ? (node.note || node.title || "未填写进展") : (node.title || "未命名任务");
+    const subtitle = isChild ? `任务 · ${chainTaskName(node.id)}` : `目标 · ${node.goal || "未填写任务目标"}`;
+    const requester = effectiveRequester(node.id) || "未填写来源人";
+    const priority = String(effectivePriority(node.id));
+    const date = node.status === "done" && node.completedAt ? node.completedAt : (node.date || isoDate(new Date()));
+    const titleMaxChars = nodeImages(node).length ? 13 : 18;
+    const titleLines = snapshotWrapText(title, titleMaxChars, 2);
+    const subtitleLines = snapshotWrapText(subtitle, nodeImages(node).length ? 20 : 28, 2);
+    return `<g>
+      <rect x="${x + 9}" y="${y}" width="222" height="24" rx="8" fill="${escapeHtml(statusColors.soft)}" stroke="${escapeHtml(statusColors.color)}" stroke-opacity=".22"></rect>
+      ${snapshotText(`链目标 · ${snapshotWrapText(chainGoal(node.id), 20, 1)[0] || "未填写任务链目标"}`, x + 22, y + 16, { size: 9, weight: 700, color: statusColors.color })}
+      <rect x="${x}" y="${cardY}" width="${NODE_WIDTH}" height="${height}" rx="14" fill="${escapeHtml(cardFill)}" stroke="${escapeHtml(statusColors.color)}" stroke-opacity="${isDone ? ".68" : ".28"}"></rect>
+      <rect x="${x}" y="${cardY}" width="${NODE_WIDTH}" height="${height}" rx="14" fill="url(#node-soft-${escapeHtml(node.id)})"></rect>
+      <rect x="${x}" y="${cardY + 12}" width="5" height="${Math.max(28, height - 24)}" rx="3" fill="${escapeHtml(statusColors.color)}"></rect>
+      <defs><linearGradient id="node-soft-${escapeHtml(node.id)}" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${escapeHtml(isDone ? palette.doneCard : statusColors.soft)}" stop-opacity="${isDone ? ".18" : ".58"}"></stop><stop offset="48%" stop-color="${escapeHtml(cardFillBottom)}" stop-opacity=".98"></stop></linearGradient></defs>
+      <rect x="${x + 17}" y="${cardY + 16}" width="22" height="22" rx="7" fill="${escapeHtml(isDone ? "rgba(255,255,255,.10)" : statusColors.soft)}" stroke="${escapeHtml(statusColors.color)}" stroke-opacity=".2"></rect>
+      ${snapshotText(requester, x + 48, cardY + 31, { size: 10, weight: 780, color: textColor })}
+      <rect x="${x + NODE_WIDTH - 52}" y="${cardY + 13}" width="24" height="24" rx="7" fill="${escapeHtml(isDone ? "rgba(255,255,255,.10)" : palette.surfaceSoft)}" stroke="${escapeHtml(palette.line)}"></rect>
+      ${snapshotText(priority, x + NODE_WIDTH - 44, cardY + 29, { size: 10, weight: 850, color: textColor })}
+      ${snapshotImageMarkup(node, x, cardY, palette)}
+      ${snapshotText(titleLines, x + 17, cardY + 70, { size: 14, lineHeight: 19, weight: 820, color: textColor })}
+      ${snapshotText(subtitleLines, x + 17, cardY + 118, { size: 10, lineHeight: 15, weight: 600, color: mutedColor })}
+      <rect x="${x}" y="${cardY + height - 30}" width="${NODE_WIDTH}" height="30" rx="0" fill="${escapeHtml(isDone ? "rgba(19,24,21,.24)" : statusColors.soft)}" opacity=".78"></rect>
+      <rect x="${x + 14}" y="${cardY + height - 22}" width="70" height="18" rx="9" fill="${escapeHtml(isDone ? "rgba(255,255,255,.10)" : palette.surface)}" stroke="${escapeHtml(statusColors.color)}" stroke-opacity=".22"></rect>
+      <circle cx="${x + 25}" cy="${cardY + height - 13}" r="3.2" fill="${escapeHtml(statusColors.color)}"></circle>
+      ${snapshotText(statusMeta[node.status]?.label || "开启", x + 34, cardY + height - 9, { size: 9, weight: 760, color: isDone ? palette.doneInk : statusColors.color })}
+      ${snapshotText(date, x + NODE_WIDTH - 67, cardY + height - 9, { size: 9, weight: 760, color: mutedColor })}
+    </g>`;
+  }
+
+  function snapshotSvgMarkup(bounds) {
+    const palette = snapshotPalette();
+    const visible = displayedNodeIds();
+    const visibleNodes = state.nodes.filter((node) => visible.has(node.id));
+    const visibleEdges = state.edges.filter((edge) => visible.has(edge.from) && visible.has(edge.to));
+    const gridX = ((-bounds.left % 24) + 24) % 24;
+    const gridY = ((-bounds.top % 24) + 24) % 24;
+    const edgeMarkup = visibleEdges.map((edge, index) => {
+      const from = nodeById(edge.from);
+      const to = nodeById(edge.to);
+      if (!from || !to) return "";
+      const geometry = snapshotEdgeGeometry(from, to, bounds);
+      const fromColor = snapshotStatusColors(from.status, palette).color;
+      const toColor = snapshotStatusColors(to.status, palette).color;
+      return `<linearGradient id="snap-edge-${index}" gradientUnits="userSpaceOnUse" x1="${geometry.x1}" y1="${geometry.y1}" x2="${geometry.x2}" y2="${geometry.y2}"><stop offset="0%" stop-color="${escapeHtml(fromColor)}"></stop><stop offset="100%" stop-color="${escapeHtml(toColor)}"></stop></linearGradient>
+        <marker id="snap-arrow-${index}" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 8 4 0 8Z" fill="${escapeHtml(toColor)}"></path></marker>
+        <path d="${geometry.path}" fill="none" stroke="${escapeHtml(palette.surface)}" stroke-width="7" opacity=".92" stroke-linecap="round"></path>
+        <path d="${geometry.path}" fill="none" stroke="url(#snap-edge-${index})" stroke-width="3.4" opacity=".96" stroke-linecap="round" marker-end="url(#snap-arrow-${index})"></path>`;
+    }).join("");
+    const nodeMarkup = visibleNodes.map((node) => snapshotNodeMarkup(node, bounds, palette)).join("");
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}" height="${bounds.height}" viewBox="0 0 ${bounds.width} ${bounds.height}">
+      <defs>
+        <style><![CDATA[text { font-family: ${palette.font}; dominant-baseline: alphabetic; }]]></style>
+        <pattern id="snapshot-grid" width="24" height="24" patternUnits="userSpaceOnUse" patternTransform="translate(${gridX} ${gridY})"><circle cx="1.2" cy="1.2" r="1.2" fill="${escapeHtml(palette.grid)}"></circle></pattern>
+        <radialGradient id="snapshot-glow" cx="22%" cy="10%" r="42%"><stop offset="0%" stop-color="${escapeHtml(palette.accentSoft)}" stop-opacity=".52"></stop><stop offset="72%" stop-color="${escapeHtml(palette.bg)}" stop-opacity="0"></stop></radialGradient>
+      </defs>
+      <rect width="100%" height="100%" fill="${escapeHtml(palette.bg)}"></rect>
+      <rect width="100%" height="100%" fill="url(#snapshot-glow)"></rect>
+      <rect width="100%" height="100%" fill="url(#snapshot-grid)"></rect>
+      ${edgeMarkup}
+      ${nodeMarkup}
+    </svg>`;
+  }
+
+  async function renderCanvasSnapshot() {
+    const bounds = visibleCanvasSnapshotBounds();
+    if (!bounds) throw new Error("当前画布没有可保存的任务节点");
+    const svg = snapshotSvgMarkup(bounds);
+    const svgUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+    try {
+      const image = await loadSnapshotImage(svgUrl);
+      const scale = snapshotScaleFor(bounds.width, bounds.height);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(bounds.width * scale);
+      canvas.height = Math.round(bounds.height * scale);
+      const context = canvas.getContext("2d");
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.scale(scale, scale);
+      context.drawImage(image, 0, 0, bounds.width, bounds.height);
+      return {
+        blob: await canvasToPngBlob(canvas),
+        width: canvas.width,
+        height: canvas.height,
+      };
+    } finally {
+      URL.revokeObjectURL(svgUrl);
+    }
+  }
+
+  async function saveCanvasSnapshot() {
+    const button = $("#snapshotButton");
+    button.disabled = true;
+    showToast("正在生成高清快照...");
+    try {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const { blob, width, height } = await renderCanvasSnapshot();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `Flowlog_画布快照_${isoDate(new Date())}.png`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(`高清快照已保存：${width}×${height}`);
+    } catch (error) {
+      console.error("保存画布快照失败", error);
+      showToast(error.message || "快照保存失败");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   async function copyReport() {
     try {
       await navigator.clipboard.writeText($("#reportPreview").value);
@@ -1378,7 +2390,7 @@
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
     $("#themeButton").innerHTML = theme === "dark" ? icons.sun : icons.moon;
-    $("meta[name='theme-color']").content = theme === "dark" ? "#171b18" : "#f4f6f3";
+    $("meta[name='theme-color']").content = theme === "dark" ? "#171b18" : "#eceee8";
   }
 
   function showToast(message) {
@@ -1389,12 +2401,44 @@
     toastTimer = setTimeout(() => toast.classList.remove("show"), 1800);
   }
 
+  function renderImageLightbox() {
+    if (!lightboxImages.length) return;
+    const image = $("#imageLightboxImage");
+    image.src = lightboxImages[lightboxIndex];
+    image.alt = `图片 ${lightboxIndex + 1}`;
+    $("#imageLightboxCount").textContent = `${lightboxIndex + 1} / ${lightboxImages.length}`;
+    $("#imageLightboxPrevious").hidden = lightboxImages.length < 2;
+    $("#imageLightboxNext").hidden = lightboxImages.length < 2;
+  }
+
+  function openImageLightbox(images, startIndex = 0) {
+    lightboxImages = normalizeImageList(images);
+    if (!lightboxImages.length) return;
+    lightboxIndex = Math.min(lightboxImages.length - 1, Math.max(0, Number(startIndex) || 0));
+    renderImageLightbox();
+    $("#imageLightbox").hidden = false;
+    $("#imageLightboxClose").focus();
+  }
+
+  function closeImageLightbox() {
+    $("#imageLightbox").hidden = true;
+    $("#imageLightboxImage").removeAttribute("src");
+    lightboxImages = [];
+    lightboxIndex = 0;
+  }
+
+  function moveImageLightbox(direction) {
+    if (lightboxImages.length < 2) return;
+    lightboxIndex = (lightboxIndex + direction + lightboxImages.length) % lightboxImages.length;
+    renderImageLightbox();
+  }
+
   canvas.addEventListener("dblclick", (event) => {
     if (event.target.closest(".task-node") || event.target.closest(".zoom-controls") || event.target.closest(".status-legend")) return;
     const point = canvasPoint(event.clientX, event.clientY);
     createNode(
       { title: "新任务", type: "start", status: "todo", priority: 0, goal: "", note: "" },
-      { x: point.x - NODE_WIDTH / 2, y: point.y - (NODE_CARD_TOP + NODE_CARD_HEIGHT) / 2 },
+      nodePositionNearPoint(point),
     );
     showToast("节点已创建，点击铅笔图标编辑");
   });
@@ -1452,9 +2496,12 @@
       return;
     }
 
-    const header = event.target.closest(".node-header");
     const nodeEl = event.target.closest(".task-node");
-    if (header && nodeEl && !event.target.closest("button, input, select, textarea, label") && event.button === 0) {
+    const dragSurface = event.target.closest(".node-card");
+    const dragControl = event.target.closest("button, input, select, textarea, label, .status-select-shell");
+    const canDragSurface = nodeEl && dragSurface && (!nodeEl.classList.contains("inline-editing") || event.target.closest(".node-header"));
+    if (canDragSurface && !dragControl && event.button === 0) {
+      event.preventDefault();
       event.stopPropagation();
       const sourceNode = nodeById(nodeEl.dataset.nodeId);
       const node = event.altKey ? duplicateNode(sourceNode) : sourceNode;
@@ -1465,13 +2512,20 @@
         renderNodes();
         showToast("已复制节点，继续拖动即可放置");
       }
-      const dragIds = !event.altKey && multiSelectedNodeIds.has(node.id) ? [...multiSelectedNodeIds] : [node.id];
-      if (!multiSelectedNodeIds.has(node.id)) {
+      const isChainDrag = !event.altKey && (event.ctrlKey || event.metaKey);
+      const dragIds = isChainDrag
+        ? connectedNodes(node.id).map((chainNode) => chainNode.id)
+        : (!event.altKey && multiSelectedNodeIds.has(node.id) ? [...multiSelectedNodeIds] : [node.id]);
+      if (isChainDrag) {
+        multiSelectedNodeIds.clear();
+        updateSelectionVisuals();
+        if (dragIds.length > 1) showToast(`按住 Ctrl，正在移动整条任务链（${dragIds.length} 个节点）`);
+      } else if (!multiSelectedNodeIds.has(node.id)) {
         multiSelectedNodeIds.clear();
         multiSelectedNodeIds.add(node.id);
         updateSelectionVisuals();
       }
-      nodeDragSession = { ids: dragIds, startX: point.x, startY: point.y, origins: dragIds.map((id) => ({ id, x: nodeById(id).x, y: nodeById(id).y })), moved: false, historySnapshot: JSON.stringify(state) };
+      nodeDragSession = { ids: dragIds, primaryId: node.id, isChainDrag, startX: point.x, startY: point.y, origins: dragIds.map((id) => ({ id, x: nodeById(id).x, y: nodeById(id).y })), moved: false, historySnapshot: JSON.stringify(state) };
       return;
     }
 
@@ -1480,7 +2534,11 @@
     if (nodeEl) return;
 
     if (event.target.closest(".zoom-controls") || event.target.closest(".status-legend")) return;
-    finalizeInlineEdit();
+    const selectedNodeIsPinned = Boolean(selectedNodeId && pinnedInlineNodeIds.has(selectedNodeId));
+    if (selectedNodeId && !selectedNodeIsPinned && !finalizeInlineEdit()) {
+      event.preventDefault();
+      return;
+    }
     expandedGoalNodes.clear();
     if (event.shiftKey && event.button === 0) {
       const rect = canvas.getBoundingClientRect();
@@ -1490,16 +2548,18 @@
       selectionBox.style.top = `${event.clientY - rect.top}px`;
       selectionBox.style.width = "0px";
       selectionBox.style.height = "0px";
-      selectedNodeId = null;
+      if (!selectedNodeIsPinned) selectedNodeId = null;
       multiSelectedNodeIds.clear();
       renderNodes();
       canvas.classList.add("selecting");
       return;
     }
-    selectedNodeId = null;
-    clearMultiSelection();
-    renderNodes();
-    renderEdges();
+    if (!selectedNodeIsPinned) {
+      selectedNodeId = null;
+      clearMultiSelection();
+      renderNodes();
+      renderEdges();
+    }
     panSession = { clientX: event.clientX, clientY: event.clientY, viewX: state.view.x, viewY: state.view.y };
     canvas.classList.add("panning");
   });
@@ -1560,6 +2620,10 @@
       return;
     }
     if (panSession) {
+      if (isPointerOutsideViewport(event)) {
+        stopCanvasPan();
+        return;
+      }
       state.view.x = panSession.viewX + event.clientX - panSession.clientX;
       state.view.y = panSession.viewY + event.clientY - panSession.clientY;
       renderView();
@@ -1580,7 +2644,7 @@
     if (connectionSession) {
       const session = connectionSession;
       const fromId = session.fromId;
-      const point = session.point;
+      const releasePoint = canvasPoint(event.clientX, event.clientY);
       const targetHandle = document.elementFromPoint(event.clientX, event.clientY)?.closest?.(".node-handle.input");
       draftEdge.hidden = true;
       draftEdge.setAttribute("d", "");
@@ -1590,18 +2654,30 @@
         return;
       }
       collapsedBranchNodes.delete(fromId);
+      autoCollapsedBranchNodes.delete(fromId);
       persistCollapsedBranches();
       if (targetHandle) {
         addEdge(fromId, targetHandle.closest(".task-node").dataset.nodeId);
       } else {
         const sourceType = derivedType(fromId);
         const inheritedStatus = sourceType === "start" || sourceType === "task" ? "doing" : "todo";
-        const newNode = createNode({ title: chainTaskName(fromId), requester: effectiveRequester(fromId), priority: effectivePriority(fromId), type: "task", status: inheritedStatus, goal: "", note: "等待补充任务信息" }, { x: point.x + 20, y: point.y - 100 }, fromId);
+        createNode(
+          { title: chainTaskName(fromId), requester: effectiveRequester(fromId), priority: effectivePriority(fromId), type: "task", status: inheritedStatus, goal: "", note: "等待补充任务信息" },
+          nodePositionNearPoint(releasePoint),
+          fromId,
+        );
         showToast("已自动创建后续节点");
       }
     }
     if (nodeDragSession) {
+      const session = nodeDragSession;
       saveState();
+      if (session.isChainDrag) {
+        multiSelectedNodeIds.clear();
+        if (selectedNodeId && session.ids.includes(selectedNodeId) && !pinnedInlineNodeIds.has(selectedNodeId)) selectedNodeId = null;
+        renderNodes();
+        renderEdges();
+      }
       nodeDragSession = null;
     }
     if (selectionSession) {
@@ -1612,17 +2688,25 @@
       if (multiSelectedNodeIds.size) showToast(`已框选 ${multiSelectedNodeIds.size} 个节点`);
     }
     if (panSession) {
-      saveState();
-      panSession = null;
-      canvas.classList.remove("panning");
+      stopCanvasPan();
     }
   });
 
   window.addEventListener("pointercancel", () => {
-    if (!edgeCancelSession) return;
-    clearTimeout(edgeCancelSession.timer);
-    edgeCancelSession.visualPath?.classList.remove("canceling");
-    edgeCancelSession = null;
+    if (edgeCancelSession) {
+      clearTimeout(edgeCancelSession.timer);
+      edgeCancelSession.visualPath?.classList.remove("canceling");
+      edgeCancelSession = null;
+    }
+    stopCanvasPan();
+  });
+
+  window.addEventListener("pointerout", (event) => {
+    if (panSession && !event.relatedTarget) stopCanvasPan();
+  });
+
+  window.addEventListener("blur", () => {
+    stopCanvasPan();
   });
 
   nodesLayer.addEventListener("click", (event) => {
@@ -1638,35 +2722,20 @@
     const createTemplate = event.target.closest("[data-create-template]");
     if (createTemplate) {
       event.stopPropagation();
+      if (!finalizeInlineEdit(createTemplate.dataset.createTemplate)) return;
       createStartTemplate(createTemplate.dataset.createTemplate);
       return;
     }
-    const closeInline = event.target.closest("[data-close-inline]");
-    if (closeInline) {
+    const inlinePinToggle = event.target.closest("[data-toggle-inline-pin]");
+    if (inlinePinToggle) {
       event.stopPropagation();
-      finalizeInlineEdit(closeInline.dataset.closeInline);
-      selectedNodeId = null;
-      renderNodes();
-      renderEdges();
+      toggleInlinePin(inlinePinToggle.dataset.toggleInlinePin);
       return;
     }
     const deleteInline = event.target.closest("[data-delete-inline]");
     if (deleteInline) {
       event.stopPropagation();
       deleteNode(deleteInline.dataset.deleteInline);
-      return;
-    }
-    const removeInlineImage = event.target.closest("[data-remove-inline-image]");
-    if (removeInlineImage) {
-      event.stopPropagation();
-      const node = nodeById(removeInlineImage.dataset.removeInlineImage);
-      if (node) {
-        pushUndoSnapshot();
-        node.image = "";
-        saveState();
-        renderAll();
-        showToast("图片已移除");
-      }
       return;
     }
     const menu = event.target.closest("[data-node-menu]");
@@ -1686,6 +2755,84 @@
     if (removeTemplate) deleteTemplate(removeTemplate.dataset.deleteTemplate);
   });
 
+  peopleList?.addEventListener("click", (event) => {
+    const deletePerson = event.target.closest("[data-delete-person]");
+    if (!deletePerson) return;
+    removeRememberedPerson(deletePerson.dataset.deletePerson);
+  });
+
+  document.addEventListener("focusin", (event) => {
+    if (!isPersonInput(event.target)) return;
+    personSuggestionIndex = -1;
+    showPersonSuggestions(event.target);
+  });
+
+  document.addEventListener("focusout", (event) => {
+    if (!isPersonInput(event.target)) return;
+    setTimeout(() => {
+      const box = personSuggestionBox();
+      if (document.activeElement === activePersonInput || box.contains(document.activeElement)) return;
+      hidePersonSuggestions();
+    }, 120);
+  });
+
+  document.addEventListener("input", (event) => {
+    if (!isPersonInput(event.target)) return;
+    personSuggestionIndex = -1;
+    showPersonSuggestions(event.target);
+  });
+
+  document.addEventListener("change", (event) => {
+    if (isPersonInput(event.target)) {
+      rememberPerson(event.target.value);
+      trackRequesterInputPublication(event.target);
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (!isPersonInput(event.target)) return;
+    const box = personSuggestionBox();
+    if (event.key === "Escape") {
+      hidePersonSuggestions();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) return;
+    if (box.hidden) showPersonSuggestions(event.target);
+    const options = $$("[data-person-suggestion]", box);
+    if (!options.length) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      personSuggestionIndex = (personSuggestionIndex + 1 + options.length) % options.length;
+      updatePersonSuggestionActive();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      personSuggestionIndex = (personSuggestionIndex - 1 + options.length) % options.length;
+      updatePersonSuggestionActive();
+      return;
+    }
+    if (event.key === "Enter" && personSuggestionIndex >= 0) {
+      event.preventDefault();
+      choosePersonSuggestion(options[personSuggestionIndex].dataset.personSuggestion);
+    }
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    const option = event.target.closest?.("[data-person-suggestion]");
+    if (option) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      choosePersonSuggestion(option.dataset.personSuggestion);
+      return;
+    }
+    if (activePersonInput && !event.target.closest?.(".person-suggestion-box") && event.target !== activePersonInput) hidePersonSuggestions();
+  });
+
+  window.addEventListener("resize", () => {
+    if (activePersonInput) showPersonSuggestions(activePersonInput);
+  });
+
   nodesLayer.addEventListener("focusin", (event) => {
     if (event.target.dataset.inlineField) fieldUndoSnapshot = JSON.stringify(state);
   });
@@ -1695,12 +2842,22 @@
     const nodeEl = event.target.closest(".task-node");
     const node = nodeById(nodeEl?.dataset.nodeId);
     if (!field || !node) return;
+    if (field === "status") return;
+    clearInlineFieldError(event.target, field);
     if (fieldUndoSnapshot) {
       pushUndoSnapshot(fieldUndoSnapshot);
       fieldUndoSnapshot = null;
     }
-    if (field === "status") setNodeStatus(node, event.target.value);
-    else node[field] = field === "priority" ? normalizePriority(event.target.value) : event.target.value;
+    const previousTitle = node.title;
+    node[field] = field === "priority" ? normalizePriority(event.target.value) : event.target.value;
+    if (field === "title" && syncGoalFromTitleIfBlankOrSynced(node, event.target.value, previousTitle)) {
+      const goalInput = $(`[data-node-id="${node.id}"] [data-inline-field="goal"]`, nodesLayer);
+      if (goalInput) {
+        goalInput.value = node.goal;
+        goalInput.style.height = "auto";
+        goalInput.style.height = `${goalInput.scrollHeight}px`;
+      }
+    }
     saveState();
     if (event.target.matches(".inline-textarea")) {
       event.target.style.height = "auto";
@@ -1709,14 +2866,13 @@
     }
   });
 
-  nodesLayer.addEventListener("paste", (event) => {
-    if (!event.target.matches(".inline-textarea")) return;
-    const file = pastedImageFile(event.clipboardData);
-    if (!file) return;
-    const node = nodeById(event.target.closest(".task-node")?.dataset.nodeId);
+  document.addEventListener("paste", (event) => {
+    const files = pastedImageFiles(event.clipboardData);
+    if (!files.length) return;
+    const node = nodeForImagePasteTarget(event.target);
     if (!node) return;
     event.preventDefault();
-    addImageToNode(node, file);
+    addImagesToNode(node, files);
   });
 
   nodesLayer.addEventListener("change", (event) => {
@@ -1724,36 +2880,59 @@
     if (quickStatusNodeId) {
       const node = nodeById(quickStatusNodeId);
       if (!node) return;
-      pushUndoSnapshot();
-      const affectedCount = setNodeStatus(node, event.target.value);
-      saveState();
-      if (!displayedNodeIds().has(node.id)) selectedNodeId = null;
+      const snapshot = JSON.stringify(state);
+      const result = setNodeStatus(node, event.target.value);
+      if (result.changedCount) {
+        pushUndoSnapshot(snapshot);
+        saveState();
+      }
+      if (!displayedNodeIds().has(node.id)) {
+        selectedNodeId = null;
+        pinnedInlineNodeIds.delete(node.id);
+      }
       renderAll();
-      showToast(node.status === "done" ? `整条任务链 ${affectedCount} 个节点已结束` : `任务状态已设置为「${statusMeta[node.status].label}」`);
+      showToast(statusChangeMessage(node, result));
       return;
     }
     const imageNodeId = event.target.dataset.nodeImage;
     if (imageNodeId) {
-      const file = event.target.files?.[0];
+      const files = event.target.files;
       const node = nodeById(imageNodeId);
-      if (!file || !node) return;
-      addImageToNode(node, file);
+      if (!files?.length || !node) return;
+      addImagesToNode(node, files);
       return;
     }
     const field = event.target.dataset.inlineField;
     const nodeEl = event.target.closest(".task-node");
     const node = nodeById(nodeEl?.dataset.nodeId);
     if (!field || !node) return;
+    if (field === "status") {
+      const snapshot = fieldUndoSnapshot || JSON.stringify(state);
+      fieldUndoSnapshot = null;
+      const result = setNodeStatus(node, event.target.value);
+      if (result.changedCount) {
+        pushUndoSnapshot(snapshot);
+        saveState();
+      }
+      if (!displayedNodeIds().has(node.id)) {
+        selectedNodeId = null;
+        pinnedInlineNodeIds.delete(node.id);
+      }
+      renderAll();
+      showToast(statusChangeMessage(node, result));
+      return;
+    }
     if (fieldUndoSnapshot) {
       pushUndoSnapshot(fieldUndoSnapshot);
       fieldUndoSnapshot = null;
     }
-    if (field === "status") setNodeStatus(node, event.target.value);
-    else node[field] = field === "priority" ? normalizePriority(event.target.value) : event.target.value;
+    node[field] = field === "priority" ? normalizePriority(event.target.value) : event.target.value;
     if (field === "priority") event.target.value = String(node[field]);
-    if (field === "requester") rememberPerson(node[field]);
+    if (field === "requester") {
+      rememberPerson(node[field]);
+      trackRequesterPublication(node);
+    }
     saveState();
-    if (field === "status" && !displayedNodeIds().has(node.id)) selectedNodeId = null;
     renderAll();
   });
 
@@ -1766,8 +2945,13 @@
     const field = event.target.dataset.field;
     const node = nodeById(selectedNodeId);
     if (!field || !node) return;
-    if (field === "status") setNodeStatus(node, event.target.value);
-    else node[field] = event.target.value;
+    if (field === "status") return;
+    const previousTitle = node.title;
+    node[field] = event.target.value;
+    if (field === "title" && syncGoalFromTitleIfBlankOrSynced(node, event.target.value, previousTitle)) {
+      const goalInput = $("#editGoal", editorContent);
+      if (goalInput) goalInput.value = node.goal;
+    }
     saveState();
     renderNodes();
     renderEdges();
@@ -1776,22 +2960,34 @@
   editorContent.addEventListener("change", (event) => {
     if (event.target.id === "editNodeImage") {
       const node = nodeById(selectedNodeId);
-      const file = event.target.files?.[0];
-      if (!node || !file) return;
-      compressImage(file).then((imageData) => {
-        node.image = imageData;
-        saveState();
-        renderAll();
-        showToast("图片已添加到节点");
-      }).catch((error) => showToast(error.message));
+      const files = event.target.files;
+      if (!node || !files?.length) return;
+      addImagesToNode(node, files);
       return;
     }
     const field = event.target.dataset.field;
     const node = nodeById(selectedNodeId);
     if (!field || !node) return;
-    if (field === "status") setNodeStatus(node, event.target.value);
-    else node[field] = event.target.value;
-    if (field === "requester") rememberPerson(node[field]);
+    if (field === "status") {
+      const snapshot = JSON.stringify(state);
+      const result = setNodeStatus(node, event.target.value);
+      if (result.changedCount) {
+        pushUndoSnapshot(snapshot);
+        saveState();
+      }
+      renderAll();
+      showToast(statusChangeMessage(node, result));
+      return;
+    }
+    node[field] = event.target.value;
+    if (field === "title" && fillGoalFromTitleIfBlank(node)) {
+      const goalInput = $("#editGoal", editorContent);
+      if (goalInput) goalInput.value = node.goal;
+    }
+    if (field === "requester") {
+      rememberPerson(node[field]);
+      trackRequesterPublication(node);
+    }
     saveState();
     renderNodes();
     renderEdges();
@@ -1803,35 +2999,29 @@
       selectedNodeId = null;
       renderAll();
     }
-    if (event.target.closest("#removeNodeImage")) {
-      const node = nodeById(selectedNodeId);
-      if (node) {
-        node.image = "";
-        saveState();
-        renderAll();
-        showToast("图片已移除");
-      }
-    }
     if (event.target.closest("#deleteNodeButton")) deleteNode(selectedNodeId);
   });
 
   $("#nodeForm").addEventListener("submit", (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    createNode({ title: form.get("title"), requester: form.get("requester"), type: form.get("type"), status: form.get("status"), goal: form.get("goal"), note: form.get("note"), image: pendingImageData }, pendingNodePosition || visibleCenterPoint());
+    const title = String(form.get("title") || "").trim();
+    const goal = String(form.get("goal") || "");
+    createNode({ title, requester: form.get("requester"), type: form.get("type"), status: form.get("status"), goal: goal.trim() ? goal : title, note: form.get("note"), images: pendingImageData }, pendingNodePosition || visibleCenterPoint());
     closeModal("nodeModal");
     showToast("节点已创建");
   });
 
   $("#newNodeImage").addEventListener("change", (event) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    compressImage(file).then((imageData) => {
-      pendingImageData = imageData;
+    const files = Array.from(event.target.files || []).slice(0, MAX_NODE_IMAGES);
+    if (!files.length) return;
+    Promise.all(files.map((file) => compressImage(file))).then((images) => {
+      pendingImageData = images;
       const preview = $("#newImagePreview");
-      preview.src = imageData;
+      preview.src = images[0];
+      preview.alt = `待上传图片预览，共 ${images.length} 张`;
       preview.hidden = false;
-      showToast("图片已准备好");
+      showToast(`已准备 ${images.length} 张图片`);
     }).catch((error) => showToast(error.message));
   });
 
@@ -1846,10 +3036,7 @@
     updateReport();
   }));
 
-  $("#addButton").addEventListener("click", () => {
-    createNode({ title: "新任务", type: "start", status: "todo", priority: 0, goal: "", note: "" }, visibleCenterPoint());
-    showToast("节点已创建，点击铅笔图标编辑");
-  });
+  $("#snapshotButton").addEventListener("click", saveCanvasSnapshot);
   $("#railAddButton").addEventListener("click", () => {
     createNode({ title: "新任务", type: "start", status: "todo", priority: 0, goal: "", note: "" }, visibleCenterPoint());
     showToast("节点已创建，点击铅笔图标编辑");
@@ -1892,6 +3079,7 @@
     state = defaultState();
     syncCollapsedBranchesFromState();
     selectedNodeId = null;
+    pinnedInlineNodeIds.clear();
     multiSelectedNodeIds.clear();
     expandedGoalNodes.clear();
     saveState();
@@ -1924,6 +3112,37 @@
     const result = event.target.closest("[data-search-start]");
     if (result) focusStartNode(result.dataset.searchStart);
   });
+  document.addEventListener("click", (event) => {
+    const removeImage = event.target.closest("[data-remove-node-image]");
+    if (removeImage) {
+      event.stopPropagation();
+      const node = nodeById(removeImage.dataset.removeNodeImage);
+      const index = Number(removeImage.dataset.imageIndex);
+      if (!node || !Number.isInteger(index)) return;
+      const previousImages = nodeImages(node);
+      if (!previousImages[index]) return;
+      pushUndoSnapshot();
+      setNodeImages(node, previousImages.filter((_, imageIndex) => imageIndex !== index));
+      if (!saveState()) {
+        setNodeImages(node, previousImages);
+        return;
+      }
+      renderAll();
+      showToast("图片已移除");
+      return;
+    }
+    const previewImage = event.target.closest("[data-preview-node-images]");
+    if (previewImage) {
+      const node = nodeById(previewImage.dataset.previewNodeImages);
+      if (node) openImageLightbox(nodeImages(node), Number(previewImage.dataset.imageIndex));
+    }
+  });
+  $("#imageLightboxClose").addEventListener("click", closeImageLightbox);
+  $("#imageLightboxPrevious").addEventListener("click", () => moveImageLightbox(-1));
+  $("#imageLightboxNext").addEventListener("click", () => moveImageLightbox(1));
+  $("#imageLightbox").addEventListener("pointerdown", (event) => {
+    if (event.target.id === "imageLightbox") closeImageLightbox();
+  });
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".task-search-shell")) searchResults.hidden = true;
     if (!event.target.closest(".data-transfer")) {
@@ -1939,6 +3158,7 @@
       return;
     }
     if (event.key === "Escape") {
+      if (!$("#imageLightbox").hidden) closeImageLightbox();
       $("#dataTransferMenu").hidden = true;
       $("#dataTransferButton").setAttribute("aria-expanded", "false");
       $$(".modal-backdrop").forEach((modal) => modal.hidden = true);
@@ -1948,6 +3168,8 @@
         draftEdge.setAttribute("d", "");
       }
     }
+    if (!$("#imageLightbox").hidden && event.key === "ArrowLeft") moveImageLightbox(-1);
+    if (!$("#imageLightbox").hidden && event.key === "ArrowRight") moveImageLightbox(1);
     const typingTarget = event.target.matches("input, textarea, select, [contenteditable='true']");
     if (event.key === "Delete" && !typingTarget && (selectedNodeId || multiSelectedNodeIds.size)) {
       event.preventDefault();
@@ -1956,9 +3178,12 @@
   });
 
   const preferredTheme = localStorage.getItem(THEME_KEY) || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  rememberPeople(state.nodes.map((node) => node.requester), { promote: false, render: false });
   syncCollapsedBranchesFromState();
+  syncRequesterPublicationStatsFromState();
+  cleanupExpiredCompletedChains();
   applyTheme(preferredTheme);
   $("#todayLabel").textContent = formatDate();
   renderAll();
-  queueServerStateSync();
+  saveState();
 })();

@@ -58,9 +58,9 @@
             <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
             导出报告
           </button>
-          <button class="button button-primary" id="addButton">
-            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-            新建节点
+          <button class="button button-primary" id="snapshotButton">
+            <svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="3"/><path d="M8 5l1.5-2h5L16 5"/><circle cx="12" cy="12" r="3.2"/></svg>
+            保存快照
           </button>
         </div>
       </header>
@@ -131,6 +131,16 @@
           </div>
           <p class="template-panel-intro">保存开始节点的任务名称、来源人、优先级和任务目标，快速创建类似任务。</p>
           <div class="template-list" id="templateList"></div>
+          <section class="people-manager" id="peopleManager" aria-label="历史需求来源人管理">
+            <div class="people-manager-header">
+              <div>
+                <span>PEOPLE</span>
+                <h3>历史来源人</h3>
+              </div>
+              <div class="people-count" id="peopleCount">0</div>
+            </div>
+            <div class="people-list" id="peopleList"></div>
+          </section>
         </aside>
 
         <aside class="editor-panel" id="editorPanel" aria-label="节点详情">
@@ -141,7 +151,7 @@
             <h2>选择一个节点</h2>
             <p>点击画布上的节点，查看并编辑任务详情。</p>
           </div>
-          <div class="editor-content" id="editorContent" hidden></div>
+          <div class="editor-content" id="editorContent" spellcheck="false" autocorrect="off" autocapitalize="off" hidden></div>
         </aside>
       </main>
 
@@ -151,11 +161,11 @@
           <div class="modal-eyebrow">NEW TASK NODE</div>
           <h2 id="nodeModalTitle">新建任务节点</h2>
           <p class="modal-intro">先记录当前要做的事，细节可以稍后在右侧面板补充。</p>
-          <form id="nodeForm">
+          <form id="nodeForm" spellcheck="false" autocorrect="off" autocapitalize="off">
             <label class="field-label" for="newNodeTitle">任务名称</label>
             <input class="text-input" id="newNodeTitle" name="title" placeholder="例如：完成数据看板原型" autocomplete="off" required />
             <label class="field-label" for="newNodeRequester">需求来源人</label>
-            <input class="text-input" id="newNodeRequester" name="requester" list="peopleSuggestions" placeholder="输入姓名，使用过的姓名会自动记住" autocomplete="off" />
+            <input class="text-input" id="newNodeRequester" name="requester" data-person-input="true" placeholder="输入姓名，使用过的姓名会自动记住" autocomplete="off" />
             <div class="form-row">
               <div>
                 <label class="field-label" for="newNodeType">节点类型</label>
@@ -183,10 +193,10 @@
             <label class="field-label">产品 / 型号图片</label>
             <label class="image-upload-control" for="newNodeImage">
               <span class="upload-icon"><svg viewBox="0 0 24 24"><path d="M4 17.5V6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5Z"/><circle cx="9" cy="9" r="2"/><path d="m4 16 4-4 3 3 2-2 7 6"/></svg></span>
-              <span><strong>选择一张图片</strong><small>会自动压缩并保存在本地</small></span>
+              <span><strong>选择一张或多张图片</strong><small>会自动压缩并保存在本地</small></span>
               <img id="newImagePreview" alt="待上传图片预览" hidden />
             </label>
-            <input id="newNodeImage" type="file" accept="image/*" hidden />
+            <input id="newNodeImage" type="file" accept="image/*" multiple hidden />
             <div class="modal-actions">
               <button type="button" class="button button-ghost" data-close-modal="nodeModal">取消</button>
               <button type="submit" class="button button-primary">创建节点</button>
@@ -205,7 +215,7 @@
             <button class="report-tab" data-period="week">周报</button>
             <button class="report-tab" data-period="month">月报</button>
           </div>
-          <textarea class="report-preview" id="reportPreview" aria-label="报告预览"></textarea>
+          <textarea class="report-preview" id="reportPreview" aria-label="报告预览" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
           <div class="modal-actions report-actions">
             <button type="button" class="button button-ghost" id="copyReportButton">
               <svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
@@ -217,6 +227,16 @@
             </button>
           </div>
         </section>
+      </div>
+
+      <div class="image-lightbox" id="imageLightbox" role="dialog" aria-modal="true" aria-label="图片预览" hidden>
+        <div class="image-lightbox-toolbar">
+          <span id="imageLightboxCount">1 / 1</span>
+          <button id="imageLightboxClose" type="button" aria-label="关闭图片预览">×</button>
+        </div>
+        <button class="image-lightbox-nav previous" id="imageLightboxPrevious" type="button" aria-label="上一张图片">‹</button>
+        <img id="imageLightboxImage" alt="图片预览" />
+        <button class="image-lightbox-nav next" id="imageLightboxNext" type="button" aria-label="下一张图片">›</button>
       </div>
 
       <div class="toast" id="toast" role="status"></div>

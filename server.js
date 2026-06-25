@@ -13,6 +13,7 @@ const PID_FILE = path.join(DATA_DIR, "server.pid");
 const REPORT_DIR = path.join(ROOT, "reports");
 const REPORT_HOUR = 17;
 const MAX_BODY_BYTES = 30 * 1024 * 1024;
+const COMPLETED_CLEANUP_DAYS = 30;
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -80,6 +81,44 @@ function connectedComponents(graph) {
   return components;
 }
 
+function normalizeCompletionDate(value) {
+  const date = String(value || "").slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
+}
+
+function dateDaysAgo(days, now = new Date()) {
+  const date = new Date(now);
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() - days);
+  return isoDate(date);
+}
+
+function cleanupExpiredCompletedChains(state, now = new Date()) {
+  if (!Array.isArray(state?.nodes) || !Array.isArray(state?.edges)) return state;
+  const graph = buildGraph(state);
+  const cutoff = dateDaysAgo(COMPLETED_CLEANUP_DAYS, now);
+  const expiredIds = new Set();
+  connectedComponents(graph).forEach((component) => {
+    if (!component.length || !component.every((node) => node.status === "done")) return;
+    const completedAt = component
+      .map((node) => normalizeCompletionDate(node.completedAt) || normalizeCompletionDate(node.date))
+      .filter(Boolean)
+      .sort()
+      .at(-1) || "";
+    if (completedAt && completedAt < cutoff) component.forEach((node) => expiredIds.add(String(node.id)));
+  });
+  if (!expiredIds.size) return state;
+  state.nodes = state.nodes.filter((node) => !expiredIds.has(String(node.id)));
+  state.edges = state.edges.filter((edge) => !expiredIds.has(String(edge.from)) && !expiredIds.has(String(edge.to)));
+  if (state.view && Array.isArray(state.view.collapsedBranches)) {
+    state.view.collapsedBranches = state.view.collapsedBranches.map(String).filter((id) => !expiredIds.has(id));
+  }
+  if (state.view && Array.isArray(state.view.autoCollapsedBranches)) {
+    state.view.autoCollapsedBranches = state.view.autoCollapsedBranches.map(String).filter((id) => !expiredIds.has(id));
+  }
+  return state;
+}
+
 function chainStart(component, graph) {
   const ids = new Set(component.map((node) => String(node.id)));
   return component.find((node) => !(graph.incoming.get(String(node.id)) || []).some((id) => ids.has(id))) || component[0];
@@ -107,7 +146,7 @@ function generateDailyReport(state, now = new Date()) {
     return left.title.localeCompare(right.title, "zh-CN");
   });
 
-  const componentLines = (component, predicate) => {
+  const componentLines = (component, predicate, { markCompleted = false } = {}) => {
     const relevant = component.filter(predicate).sort((a, b) => Number(a.x) - Number(b.x) || Number(a.y) - Number(b.y));
     if (!relevant.length) return [];
     const { start, requester, title } = componentInfo(component);
@@ -124,7 +163,8 @@ function generateDailyReport(state, now = new Date()) {
     const startBlocker = relevant.includes(start) && start.status === "blocked"
       ? `｜卡点：${compact(start.note) || compact(start.title) || "未填写"}`
       : "";
-    const lines = [`${requester}｜${title}${startBlocker}`];
+    const completionSuffix = markCompleted ? "｜已完成" : "";
+    const lines = [`${requester}｜${title}${startBlocker}${completionSuffix}`];
     const relevantIds = new Set(relevant.map((node) => String(node.id)));
     const descendantMemo = new Map();
     const hasRelevantDescendant = (nodeId, visiting = new Set()) => {
@@ -148,7 +188,7 @@ function generateDailyReport(state, now = new Date()) {
           const label = child.status === "blocked"
             ? `卡点：${compact(child.note) || compact(child.title) || "未填写"}`
             : compact(child.note) || String(child.title || "未命名任务");
-          lines.push(`${"  ".repeat(depth)}- ${label}`);
+          lines.push(`${"  ".repeat(depth)}- ${label}${markCompleted ? "｜已完成" : ""}`);
           rendered.add(childId);
         }
         appendChildren(childId, showChild ? depth + 1 : depth, nextVisiting);
@@ -162,16 +202,20 @@ function generateDailyReport(state, now = new Date()) {
       const label = node.status === "blocked"
         ? `卡点：${compact(node.note) || compact(node.title) || "未填写"}`
         : compact(node.note) || String(node.title || "未命名任务");
-      lines.push(`  - ${label}`);
+      lines.push(`  - ${label}${markCompleted ? "｜已完成" : ""}`);
       rendered.add(nodeId);
     });
     return lines;
   };
 
-  const completed = components.flatMap((component) => componentLines(
-    component,
-    (node) => node.status === "done" && String(node.completedAt || "").slice(0, 10) === today,
-  ));
+  const completedToday = (node) => node?.status === "done" && String(node.completedAt || "").slice(0, 10) === today;
+  const completed = components.flatMap((component) => {
+    const start = chainStart(component, graph);
+    const completedAsChain = component.every((node) => node.status === "done") && completedToday(start);
+    return completedAsChain
+      ? componentLines(component, () => true, { markCompleted: component.length > 1 })
+      : componentLines(component, completedToday);
+  });
   const unfinished = components.flatMap((component) => componentLines(component, (node) => node.status !== "done"));
   return [
     `工作日报｜${today}`,
@@ -214,8 +258,9 @@ function saveDailyReport(date = new Date(), overwrite = false) {
 
 function saveStateSnapshot(state) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  const cleanedState = cleanupExpiredCompletedChains(state);
   const tempFile = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify({ savedAt: new Date().toISOString(), state }), "utf8");
+  fs.writeFileSync(tempFile, JSON.stringify({ savedAt: new Date().toISOString(), state: cleanedState }), "utf8");
   fs.renameSync(tempFile, STATE_FILE);
   const now = new Date();
   if (now.getHours() >= REPORT_HOUR && !fs.existsSync(reportFile(now))) saveDailyReport(now);
